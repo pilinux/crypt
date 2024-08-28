@@ -12,6 +12,7 @@ cryptographic primitives.
 
 - [AES](_example/aes/main.go)
 - [ChaCha20-Poly1305 AEAD](_example/chacha20poly1305/main.go)
+- [XChaCha20-Poly1305 AEAD](_example/xchacha20poly1305/main.go)
 - [RSA](_example/rsa/main.go)
 - [Hashing](_example/hashing/main.go)
 
