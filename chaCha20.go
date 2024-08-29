@@ -2,6 +2,7 @@ package crypt
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -52,6 +53,32 @@ func DecryptChacha20poly1305(key, nonce, ciphertext []byte) (text string, err er
 	}
 	text = string(plaintext)
 
+	return
+}
+
+// EncryptChacha20poly1305WithNonceAppended encrypts and authenticates the given message with
+// ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
+// It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
+func EncryptChacha20poly1305WithNonceAppended(key []byte, text string) (ciphertext []byte, err error) {
+	ciphertext, nonce, err := EncryptChacha20poly1305(key, text)
+	if err != nil {
+		return
+	}
+	ciphertext = append(nonce, ciphertext...)
+	return
+}
+
+// DecryptChacha20poly1305WithNonceAppended decrypts and authenticates the given message with
+// ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
+// It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
+func DecryptChacha20poly1305WithNonceAppended(key, ciphertext []byte) (text string, err error) {
+	nonceSize := chacha20poly1305.NonceSize
+	if len(ciphertext) < nonceSize {
+		err = errors.New("ciphertext is too short")
+		return
+	}
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	text, err = DecryptChacha20poly1305(key, nonce, ciphertext)
 	return
 }
 
