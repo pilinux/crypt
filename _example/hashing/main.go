@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/sha3"
+	// "github.com/zeebo/blake3"
 )
 
 /*
@@ -111,4 +112,24 @@ func main() {
 	fmt.Println(blake2b512Sum)
 	fmt.Printf("hex: %x\n", blake2b512Sum)
 	fmt.Println("length", len(blake2b512Sum))
+	fmt.Println("")
+
+	// calculate BLAKE3-256 hash
+	/*
+		blake3Hash256 := blake3.Sum256(data)
+		fmt.Println("blake3Hash256:")
+		fmt.Println(blake3Hash256)
+		fmt.Printf("hex: %x\n", blake3Hash256)
+		fmt.Println("length", len(blake3Hash256))
+		fmt.Println("")
+	*/
+
+	// calculate BLAKE3-512 hash
+	/*
+		blake3Hash512 := blake3.Sum512(data)
+		fmt.Println("blake3Hash512:")
+		fmt.Println(blake3Hash512)
+		fmt.Printf("hex: %x\n", blake3Hash512)
+		fmt.Println("length", len(blake3Hash512))
+	*/
 }
