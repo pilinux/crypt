@@ -78,4 +78,52 @@ func main() {
 		return
 	}
 	fmt.Println("plaintext:", plaintext)
+
+	// encrypt the data with AES-128 in GCM using EncryptAesGcmWithNonceAppended function
+	ciphertext128, err = crypt.EncryptAesGcmWithNonceAppended(key128, text)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("ciphertext (AES-128):", ciphertext128)
+
+	// decrypt the data with AES-128 in GCM using DecryptAesGcmWithNonceAppended function
+	plaintext, err = crypt.DecryptAesGcmWithNonceAppended(key128, ciphertext128)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("plaintext:", plaintext)
+
+	// encrypt the data with AES-192 in GCM using EncryptAesGcmWithNonceAppended function
+	ciphertext192, err = crypt.EncryptAesGcmWithNonceAppended(key192, text)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("ciphertext (AES-192):", ciphertext192)
+
+	// decrypt the data with AES-192 in GCM using DecryptAesGcmWithNonceAppended function
+	plaintext, err = crypt.DecryptAesGcmWithNonceAppended(key192, ciphertext192)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("plaintext:", plaintext)
+
+	// encrypt the data with AES-256 in GCM using EncryptAesGcmWithNonceAppended function
+	ciphertext256, err = crypt.EncryptAesGcmWithNonceAppended(key256, text)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("ciphertext (AES-256):", ciphertext256)
+
+	// decrypt the data with AES-256 in GCM using DecryptAesGcmWithNonceAppended function
+	plaintext, err = crypt.DecryptAesGcmWithNonceAppended(key256, ciphertext256)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("plaintext:", plaintext)
 }
