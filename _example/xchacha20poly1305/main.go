@@ -45,4 +45,20 @@ func main() {
 		return
 	}
 	fmt.Println("plaintext:", plaintext)
+
+	// encrypt the data using EncryptXChacha20poly1305WithNonceAppended function
+	ciphertext, err = crypt.EncryptXChacha20poly1305WithNonceAppended(key, text)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("ciphertext:", ciphertext)
+
+	// decrypt the data using DecryptXChacha20poly1305WithNonceAppended function
+	plaintext, err = crypt.DecryptXChacha20poly1305WithNonceAppended(key, ciphertext)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("plaintext:", plaintext)
 }
