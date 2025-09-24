@@ -3,11 +3,11 @@ package main
 
 import (
 	"crypto/sha256"
+	"crypto/sha3"
 	"crypto/sha512"
 	"fmt"
 
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/crypto/sha3"
 	// "github.com/zeebo/blake3"
 )
 
@@ -15,9 +15,9 @@ import (
 SHA256                      // import crypto/sha256
 SHA384                      // import crypto/sha512
 SHA512                      // import crypto/sha512
-SHA3_256                    // import golang.org/x/crypto/sha3
-SHA3_384                    // import golang.org/x/crypto/sha3
-SHA3_512                    // import golang.org/x/crypto/sha3
+SHA3_256                    // import crypto/sha3
+SHA3_384                    // import crypto/sha3
+SHA3_512                    // import crypto/sha3
 SHA512_256                  // import crypto/sha512
 BLAKE2b_256                 // import golang.org/x/crypto/blake2b
 BLAKE2b_384                 // import golang.org/x/crypto/blake2b
