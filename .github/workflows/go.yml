@@ -51,3 +51,14 @@ jobs:
         uses: securego/gosec@master
         with:
           args: -exclude-dir=_example -exclude=G407 ./...
+
+      - name: Test
+        run: go test -race -v -cover -coverpkg=./... -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Upload coverage reports to Codecov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: pilinux/crypt
+          files: ./coverage.txt
