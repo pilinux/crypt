@@ -2,55 +2,51 @@ package crypt
 
 import "encoding/base64"
 
-// ToBase64Std - encode the binary data into a Base64-encoded string
-// using the standard Base64 character set.
+// ToBase64Std encodes binary data to a Base64 string using the standard
+// alphabet (RFC 4648).
 func (e *Encoder) ToBase64Std(text []byte) string {
 	return base64.StdEncoding.EncodeToString(text)
 }
 
-// ToBase64RawStd - encode the binary data into a Base64-encoded string
-// using the standard raw, unpadded base64 encoding character set, as
-// defined in RFC 4648 section 3.2. This is the same as StdEncoding but
-// omits the padding characters.
+// ToBase64RawStd encodes binary data to a Base64 string using the standard
+// alphabet without padding (RFC 4648 section 3.2): the same as ToBase64Std but
+// with the trailing '=' characters omitted.
 func (e *Encoder) ToBase64RawStd(text []byte) string {
 	return base64.RawStdEncoding.EncodeToString(text)
 }
 
-// ToBase64URL - encode the binary data into a Base64-encoded string
-// using the alternate base64 encoding defined in RFC 4648 suitable for
-// URLs and file names.
+// ToBase64URL encodes binary data to a Base64 string using the URL- and
+// filename-safe alphabet (RFC 4648 section 5).
 func (e *Encoder) ToBase64URL(text []byte) string {
 	return base64.URLEncoding.EncodeToString(text)
 }
 
-// ToBase64RawURL - encode the binary data into a Base64-encoded string
-// using the unpadded alternate base64 encoding defined in RFC 4648
-// suitable for URLs and file names. It omits the padding characters.
+// ToBase64RawURL encodes binary data to a Base64 string using the URL- and
+// filename-safe alphabet without padding (RFC 4648 section 5).
 func (e *Encoder) ToBase64RawURL(text []byte) string {
 	return base64.RawURLEncoding.EncodeToString(text)
 }
 
-// FromBase64Std - decode the Base64-encoded string into binary data
-// using the standard Base64 character set.
+// FromBase64Std decodes a Base64 string produced with the standard alphabet
+// (RFC 4648) back into binary data.
 func (d *Decoder) FromBase64Std(text string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(text)
 }
 
-// FromBase64RawStd - decode the Base64-encoded string into binary data
-// using the standard raw, unpadded Base64 encoding character set, as
-// defined in RFC 4648 section 3.2.
+// FromBase64RawStd decodes an unpadded Base64 string produced with the standard
+// alphabet (RFC 4648 section 3.2) back into binary data.
 func (d *Decoder) FromBase64RawStd(text string) ([]byte, error) {
 	return base64.RawStdEncoding.DecodeString(text)
 }
 
-// FromBase64URL - decode the Base64-encoded string into binary data
-// using the alternate base64 encoding defined in RFC 4648.
+// FromBase64URL decodes a Base64 string produced with the URL- and
+// filename-safe alphabet (RFC 4648 section 5) back into binary data.
 func (d *Decoder) FromBase64URL(text string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(text)
 }
 
-// FromBase64RawURL - decode the Base64-encoded string into binary data
-// using the unpadded alternate base64 encoding defined in RFC 4648.
+// FromBase64RawURL decodes an unpadded Base64 string produced with the URL- and
+// filename-safe alphabet (RFC 4648 section 5) back into binary data.
 func (d *Decoder) FromBase64RawURL(text string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(text)
 }
