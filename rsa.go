@@ -8,8 +8,8 @@ import (
 	"fmt"
 )
 
-// EncryptRSA encrypts the given message with RSA-OAEP and using SHA-256 (default) or SHA-512.
-func (e *Encoder) EncryptRSA(text string) (ciphertext []byte, err error) {
+// EncryptByteRSA encrypts the given message (bytes) with RSA-OAEP and using SHA-256 (default) or SHA-512.
+func (e *Encoder) EncryptByteRSA(input []byte) (ciphertext []byte, err error) {
 	pubKey, err := x509.ParsePKIXPublicKey(e.PubKeyBlock.Bytes)
 	if err != nil {
 		err = fmt.Errorf("error parsing public key: %v", err)
@@ -35,7 +35,7 @@ func (e *Encoder) EncryptRSA(text string) (ciphertext []byte, err error) {
 		hashAlg.New(),
 		rand.Reader,
 		rsaPubKey,
-		[]byte(text),
+		input,
 		nil,
 	)
 	if err != nil {
@@ -46,8 +46,13 @@ func (e *Encoder) EncryptRSA(text string) (ciphertext []byte, err error) {
 	return
 }
 
-// DecryptRSA decrypts the given message with RSA-OAEP and using SHA-256 (default) or SHA-512.
-func (d *Decoder) DecryptRSA(ciphertext []byte) (text string, err error) {
+// EncryptRSA encrypts the given message (string) with RSA-OAEP and using SHA-256 (default) or SHA-512.
+func (e *Encoder) EncryptRSA(text string) (ciphertext []byte, err error) {
+	return e.EncryptByteRSA([]byte(text))
+}
+
+// DecryptByteRSA decrypts the given message with RSA-OAEP and using SHA-256 (default) or SHA-512.
+func (d *Decoder) DecryptByteRSA(ciphertext []byte) (plaintext []byte, err error) {
 	priKey, err := x509.ParsePKCS8PrivateKey(d.PriKeyBlock.Bytes)
 	if err != nil {
 		err = fmt.Errorf("error parsing private key: %v", err)
@@ -69,7 +74,7 @@ func (d *Decoder) DecryptRSA(ciphertext []byte) (text string, err error) {
 	}
 
 	// decrypt the data using RSA-OAEP
-	plaintext, err := rsa.DecryptOAEP(
+	plaintext, err = rsa.DecryptOAEP(
 		hashAlg.New(),
 		rand.Reader,
 		rsaPriKey,
@@ -80,7 +85,17 @@ func (d *Decoder) DecryptRSA(ciphertext []byte) (text string, err error) {
 		err = fmt.Errorf("error decrypting data: %v", err)
 		return
 	}
-	text = string(plaintext)
 
+	return
+}
+
+// DecryptRSA decrypts the given message with RSA-OAEP and using SHA-256 (default) or SHA-512.
+func (d *Decoder) DecryptRSA(ciphertext []byte) (text string, err error) {
+	plaintext, err := d.DecryptByteRSA(ciphertext)
+	if err != nil {
+		return
+	}
+
+	text = string(plaintext)
 	return
 }

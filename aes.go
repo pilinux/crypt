@@ -4,12 +4,13 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"errors"
 	"fmt"
 )
 
-// EncryptAesGcm encrypts and authenticates the given message with AES in GCM mode
+// EncryptByteAesGcm encrypts and authenticates the given message (bytes) with AES in GCM mode
 // using the given 128, 192 or 256-bit key.
-func EncryptAesGcm(key []byte, text string) (ciphertext []byte, nonce []byte, err error) {
+func EncryptByteAesGcm(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
 	// create a new AES cipher block
 	// the key argument should be the AES key, either 16, 24, or 32 bytes
 	// to select AES-128, AES-192, or AES-256
@@ -34,18 +35,21 @@ func EncryptAesGcm(key []byte, text string) (ciphertext []byte, nonce []byte, er
 		return
 	}
 
-	// data to be encrypted
-	data := []byte(text)
-
 	// encrypt the data
-	ciphertext = aead.Seal(nil, nonce, data, nil)
+	ciphertext = aead.Seal(nil, nonce, input, nil)
 
 	return
 }
 
-// DecryptAesGcm decrypts and authenticates the given message with AES in GCM mode
+// EncryptAesGcm encrypts and authenticates the given message (string) with AES in GCM mode
+// using the given 128, 192 or 256-bit key.
+func EncryptAesGcm(key []byte, text string) (ciphertext []byte, nonce []byte, err error) {
+	return EncryptByteAesGcm(key, []byte(text))
+}
+
+// DecryptByteAesGcm decrypts and authenticates the given message with AES in GCM mode
 // using the given 128, 192 or 256-bit key and 96-bit nonce.
-func DecryptAesGcm(key, nonce, ciphertext []byte) (text string, err error) {
+func DecryptByteAesGcm(key, nonce, ciphertext []byte) (plaintext []byte, err error) {
 	// create a new AES cipher block
 	// the key argument should be the AES key, either 16, 24, or 32 bytes
 	// to select AES-128, AES-192, or AES-256
@@ -63,38 +67,71 @@ func DecryptAesGcm(key, nonce, ciphertext []byte) (text string, err error) {
 	}
 
 	// decrypt the data
-	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err = aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		err = fmt.Errorf("error decrypting data: %v", err)
 		return
 	}
-	text = string(plaintext)
 
 	return
 }
 
-// EncryptAesGcmWithNonceAppended encrypts and authenticates the given message with AES in GCM mode
-// using the given 128, 192 or 256-bit key.
-// It appends the ciphertext to the nonce.
-func EncryptAesGcmWithNonceAppended(key []byte, text string) (ciphertext []byte, err error) {
-	ciphertext, nonce, err := EncryptAesGcm(key, text)
+// DecryptAesGcm decrypts and authenticates the given message with AES in GCM mode
+// using the given 128, 192 or 256-bit key and 96-bit nonce.
+func DecryptAesGcm(key, nonce, ciphertext []byte) (text string, err error) {
+	// decrypt the data
+	plaintext, err := DecryptByteAesGcm(key, nonce, ciphertext)
 	if err != nil {
 		return
 	}
+
+	text = string(plaintext)
+	return
+}
+
+// EncryptByteAesGcmWithNonceAppended encrypts and authenticates the given message (bytes) with AES in GCM mode
+// using the given 128, 192 or 256-bit key.
+// It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
+func EncryptByteAesGcmWithNonceAppended(key []byte, input []byte) (ciphertext []byte, err error) {
+	ciphertext, nonce, err := EncryptByteAesGcm(key, input)
+	if err != nil {
+		return
+	}
+
 	ciphertext = append(nonce, ciphertext...)
 	return
 }
 
-// DecryptAesGcmWithNonceAppended decrypts and authenticates the given message with AES in GCM mode
+// EncryptAesGcmWithNonceAppended encrypts and authenticates the given message (string) with AES in GCM mode
 // using the given 128, 192 or 256-bit key.
-// It expects the ciphertext to have the nonce appended.
-func DecryptAesGcmWithNonceAppended(key, ciphertext []byte) (text string, err error) {
+// It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
+func EncryptAesGcmWithNonceAppended(key []byte, text string) (ciphertext []byte, err error) {
+	return EncryptByteAesGcmWithNonceAppended(key, []byte(text))
+}
+
+// DecryptByteAesGcmWithNonceAppended decrypts and authenticates the given ciphertext with AES in GCM mode
+// using the given 128, 192 or 256-bit key.
+// It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
+func DecryptByteAesGcmWithNonceAppended(key, ciphertext []byte) (plaintext []byte, err error) {
 	nonceSize := 12
 	if len(ciphertext) < nonceSize {
-		err = fmt.Errorf("ciphertext is too short")
+		err = errors.New("ciphertext is too short")
 		return
 	}
+
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	text, err = DecryptAesGcm(key, nonce, ciphertext)
+	return DecryptByteAesGcm(key, nonce, ciphertext)
+}
+
+// DecryptAesGcmWithNonceAppended decrypts and authenticates the given ciphertext with AES in GCM mode
+// using the given 128, 192 or 256-bit key.
+// It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
+func DecryptAesGcmWithNonceAppended(key, ciphertext []byte) (text string, err error) {
+	plaintext, err := DecryptByteAesGcmWithNonceAppended(key, ciphertext)
+	if err != nil {
+		return
+	}
+
+	text = string(plaintext)
 	return
 }
