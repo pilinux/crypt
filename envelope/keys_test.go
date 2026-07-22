@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/pilinux/crypt"
 )
 
 // validSecret is a 40-character secret, comfortably above MinSecretLength.
@@ -120,4 +122,28 @@ func TestWrapUnwrapKey(t *testing.T) {
 			t.Errorf("WrapKey err = %v, want ErrInvalidKeySize", err)
 		}
 	})
+
+	t.Run("rejectNonKeyPlaintext", func(t *testing.T) {
+		// a blob that authenticates under the KEK but does not hold a 32-byte
+		// key was never produced by WrapKey and must be rejected.
+		notAKey, err := crypt.EncryptByteXChacha20poly1305WithNonceAppended(kek, []byte("only-8b!"))
+		if err != nil {
+			t.Fatalf("encrypt error: %v", err)
+		}
+		if _, err := UnwrapKey(kek, notAKey); err != ErrInvalidKeySize {
+			t.Errorf("UnwrapKey err = %v, want ErrInvalidKeySize", err)
+		}
+	})
+}
+
+func TestZero(t *testing.T) {
+	b := []byte{1, 2, 3, 4, 5}
+	Zero(b)
+	for i, v := range b {
+		if v != 0 {
+			t.Errorf("b[%d] = %d after Zero, want 0", i, v)
+		}
+	}
+
+	Zero(nil) // must not panic
 }

@@ -17,6 +17,9 @@ type aead struct {
 	encByteNA func(key, input []byte) ([]byte, error)
 	decByteNA func(key, ciphertext []byte) ([]byte, error)
 
+	encByteNAAAD func(key, input, additionalData []byte) ([]byte, error)
+	decByteNAAAD func(key, ciphertext, additionalData []byte) ([]byte, error)
+
 	encStr   func(key []byte, text string) ([]byte, []byte, error)
 	decStr   func(key, nonce, ciphertext []byte) (string, error)
 	encStrNA func(key []byte, text string) ([]byte, error)
@@ -27,25 +30,29 @@ func aeads() []aead {
 	return []aead{
 		{
 			name: "ChaCha20-Poly1305", nonceSize: 12, tagSize: 16,
-			encByte:   EncryptByteChacha20poly1305,
-			decByte:   DecryptByteChacha20poly1305,
-			encByteNA: EncryptByteChacha20poly1305WithNonceAppended,
-			decByteNA: DecryptByteChacha20poly1305WithNonceAppended,
-			encStr:    EncryptChacha20poly1305,
-			decStr:    DecryptChacha20poly1305,
-			encStrNA:  EncryptChacha20poly1305WithNonceAppended,
-			decStrNA:  DecryptChacha20poly1305WithNonceAppended,
+			encByte:      EncryptByteChacha20poly1305,
+			decByte:      DecryptByteChacha20poly1305,
+			encByteNA:    EncryptByteChacha20poly1305WithNonceAppended,
+			decByteNA:    DecryptByteChacha20poly1305WithNonceAppended,
+			encByteNAAAD: EncryptByteChacha20poly1305WithNonceAppendedAAD,
+			decByteNAAAD: DecryptByteChacha20poly1305WithNonceAppendedAAD,
+			encStr:       EncryptChacha20poly1305,
+			decStr:       DecryptChacha20poly1305,
+			encStrNA:     EncryptChacha20poly1305WithNonceAppended,
+			decStrNA:     DecryptChacha20poly1305WithNonceAppended,
 		},
 		{
 			name: "XChaCha20-Poly1305", nonceSize: 24, tagSize: 16,
-			encByte:   EncryptByteXChacha20poly1305,
-			decByte:   DecryptByteXChacha20poly1305,
-			encByteNA: EncryptByteXChacha20poly1305WithNonceAppended,
-			decByteNA: DecryptByteXChacha20poly1305WithNonceAppended,
-			encStr:    EncryptXChacha20poly1305,
-			decStr:    DecryptXChacha20poly1305,
-			encStrNA:  EncryptXChacha20poly1305WithNonceAppended,
-			decStrNA:  DecryptXChacha20poly1305WithNonceAppended,
+			encByte:      EncryptByteXChacha20poly1305,
+			decByte:      DecryptByteXChacha20poly1305,
+			encByteNA:    EncryptByteXChacha20poly1305WithNonceAppended,
+			decByteNA:    DecryptByteXChacha20poly1305WithNonceAppended,
+			encByteNAAAD: EncryptByteXChacha20poly1305WithNonceAppendedAAD,
+			decByteNAAAD: DecryptByteXChacha20poly1305WithNonceAppendedAAD,
+			encStr:       EncryptXChacha20poly1305,
+			decStr:       DecryptXChacha20poly1305,
+			encStrNA:     EncryptXChacha20poly1305WithNonceAppended,
+			decStrNA:     DecryptXChacha20poly1305WithNonceAppended,
 		},
 	}
 }
@@ -131,6 +138,72 @@ func TestChacha20WithNonceAppended(t *testing.T) {
 				}
 				if !bytes.Equal(got, in) {
 					t.Errorf("round-trip mismatch: got %q, want %q", got, in)
+				}
+			})
+		})
+	}
+}
+
+func TestChacha20WithNonceAppendedAAD(t *testing.T) {
+	const text = "attack at dawn"
+	aad := []byte("record:42")
+
+	for _, a := range aeads() {
+		t.Run(a.name, func(t *testing.T) {
+			key := mustBytes(t, 32)
+
+			t.Run("roundTrip", func(t *testing.T) {
+				in := []byte(text)
+				ciphertext, err := a.encByteNAAAD(key, in, aad)
+				if err != nil {
+					t.Fatalf("encrypt: %v", err)
+				}
+				if want := a.nonceSize + len(text) + a.tagSize; len(ciphertext) != want {
+					t.Errorf("ciphertext len = %d, want %d (AAD must not be stored)", len(ciphertext), want)
+				}
+				got, err := a.decByteNAAAD(key, ciphertext, aad)
+				if err != nil {
+					t.Fatalf("decrypt: %v", err)
+				}
+				if !bytes.Equal(got, in) {
+					t.Errorf("round-trip mismatch: got %q, want %q", got, in)
+				}
+			})
+
+			t.Run("wrongAADFails", func(t *testing.T) {
+				ciphertext, err := a.encByteNAAAD(key, []byte(text), aad)
+				if err != nil {
+					t.Fatalf("encrypt: %v", err)
+				}
+				if _, err := a.decByteNAAAD(key, ciphertext, []byte("record:7")); err == nil {
+					t.Error("decryption with wrong AAD succeeded, want failure")
+				}
+				if _, err := a.decByteNA(key, ciphertext); err == nil {
+					t.Error("decryption without AAD succeeded, want failure")
+				}
+			})
+
+			t.Run("nilAADMatchesPlainVariant", func(t *testing.T) {
+				ciphertext, err := a.encByteNAAAD(key, []byte(text), nil)
+				if err != nil {
+					t.Fatalf("encrypt: %v", err)
+				}
+				if _, err := a.decByteNA(key, ciphertext); err != nil {
+					t.Errorf("plain decrypt of nil-AAD ciphertext failed: %v", err)
+				}
+
+				ciphertext, err = a.encByteNA(key, []byte(text))
+				if err != nil {
+					t.Fatalf("encrypt: %v", err)
+				}
+				if _, err := a.decByteNAAAD(key, ciphertext, nil); err != nil {
+					t.Errorf("nil-AAD decrypt of plain ciphertext failed: %v", err)
+				}
+			})
+
+			t.Run("tooShort", func(t *testing.T) {
+				if _, err := a.decByteNAAAD(key, []byte{1, 2, 3}, aad); err == nil {
+					t.Error("expected error for too-short ciphertext, got nil")
 				}
 			})
 		})

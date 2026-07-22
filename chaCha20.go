@@ -8,9 +8,10 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// EncryptByteChacha20poly1305 encrypts and authenticates the given message (bytes) with
-// ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
-func EncryptByteChacha20poly1305(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
+// encryptByteChacha20poly1305 is the shared ChaCha20-Poly1305 encryption core.
+// It seals input under key with a fresh random 96-bit nonce and additionally
+// authenticates additionalData (which may be nil).
+func encryptByteChacha20poly1305(key, input, additionalData []byte) (ciphertext []byte, nonce []byte, err error) {
 	// create a new ChaCha20-Poly1305 AEAD using the given 256-bit key
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
@@ -27,8 +28,34 @@ func EncryptByteChacha20poly1305(key []byte, input []byte) (ciphertext []byte, n
 	}
 
 	// encrypt the data
-	ciphertext = aead.Seal(nil, nonce, input, nil)
+	ciphertext = aead.Seal(nil, nonce, input, additionalData)
 	return
+}
+
+// decryptByteChacha20poly1305 is the shared ChaCha20-Poly1305 decryption core.
+// additionalData must be the same value supplied at encryption (nil if none).
+func decryptByteChacha20poly1305(key, nonce, ciphertext, additionalData []byte) (plaintext []byte, err error) {
+	// create a new ChaCha20-Poly1305 AEAD using the given 256-bit key
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// decrypt the data
+	plaintext, err = aead.Open(nil, nonce, ciphertext, additionalData)
+	if err != nil {
+		err = fmt.Errorf("error decrypting data: %v", err)
+		return
+	}
+
+	return
+}
+
+// EncryptByteChacha20poly1305 encrypts and authenticates the given message (bytes) with
+// ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
+func EncryptByteChacha20poly1305(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
+	return encryptByteChacha20poly1305(key, input, nil)
 }
 
 // EncryptChacha20poly1305 encrypts and authenticates the given message (string) with
@@ -40,21 +67,7 @@ func EncryptChacha20poly1305(key []byte, text string) (ciphertext []byte, nonce 
 // DecryptByteChacha20poly1305 decrypts and authenticates the given ciphertext with
 // ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
 func DecryptByteChacha20poly1305(key, nonce, ciphertext []byte) (plaintext []byte, err error) {
-	// create a new ChaCha20-Poly1305 AEAD using the given 256-bit key
-	aead, err := chacha20poly1305.New(key)
-	if err != nil {
-		err = fmt.Errorf("error creating AEAD: %v", err)
-		return
-	}
-
-	// decrypt the data
-	plaintext, err = aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		err = fmt.Errorf("error decrypting data: %v", err)
-		return
-	}
-
-	return
+	return decryptByteChacha20poly1305(key, nonce, ciphertext, nil)
 }
 
 // DecryptChacha20poly1305 decrypts and authenticates the given ciphertext with
@@ -74,13 +87,7 @@ func DecryptChacha20poly1305(key, nonce, ciphertext []byte) (text string, err er
 // ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
 // It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
 func EncryptByteChacha20poly1305WithNonceAppended(key []byte, input []byte) (ciphertext []byte, err error) {
-	ciphertext, nonce, err := EncryptByteChacha20poly1305(key, input)
-	if err != nil {
-		return
-	}
-
-	ciphertext = append(nonce, ciphertext...)
-	return
+	return EncryptByteChacha20poly1305WithNonceAppendedAAD(key, input, nil)
 }
 
 // EncryptChacha20poly1305WithNonceAppended encrypts and authenticates the given message (string) with
@@ -94,14 +101,7 @@ func EncryptChacha20poly1305WithNonceAppended(key []byte, text string) (cipherte
 // ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce.
 // It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
 func DecryptByteChacha20poly1305WithNonceAppended(key, ciphertext []byte) (plaintext []byte, err error) {
-	nonceSize := chacha20poly1305.NonceSize
-	if len(ciphertext) < nonceSize {
-		err = errors.New("ciphertext is too short")
-		return
-	}
-
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return DecryptByteChacha20poly1305(key, nonce, ciphertext)
+	return DecryptByteChacha20poly1305WithNonceAppendedAAD(key, ciphertext, nil)
 }
 
 // DecryptChacha20poly1305WithNonceAppended decrypts and authenticates the given ciphertext with
@@ -117,9 +117,43 @@ func DecryptChacha20poly1305WithNonceAppended(key, ciphertext []byte) (text stri
 	return
 }
 
-// EncryptByteXChacha20poly1305 encrypts and authenticates the given message (bytes) with
-// XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce.
-func EncryptByteXChacha20poly1305(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
+// EncryptByteChacha20poly1305WithNonceAppendedAAD encrypts and authenticates the given
+// message (bytes) with ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce,
+// and additionally authenticates additionalData (AAD). The AAD is neither encrypted nor
+// included in the output; the identical bytes must be supplied at decryption. A nil AAD
+// makes this equivalent to EncryptByteChacha20poly1305WithNonceAppended.
+// It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
+func EncryptByteChacha20poly1305WithNonceAppendedAAD(key, input, additionalData []byte) (ciphertext []byte, err error) {
+	ciphertext, nonce, err := encryptByteChacha20poly1305(key, input, additionalData)
+	if err != nil {
+		return
+	}
+
+	ciphertext = append(nonce, ciphertext...)
+	return
+}
+
+// DecryptByteChacha20poly1305WithNonceAppendedAAD decrypts and authenticates the given
+// ciphertext with ChaCha20-Poly1305 AEAD using the given 256-bit key and 96-bit nonce,
+// verifying additionalData (AAD) against the value supplied at encryption. Decryption
+// fails if the AAD differs. A nil AAD makes this equivalent to
+// DecryptByteChacha20poly1305WithNonceAppended.
+// It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
+func DecryptByteChacha20poly1305WithNonceAppendedAAD(key, ciphertext, additionalData []byte) (plaintext []byte, err error) {
+	nonceSize := chacha20poly1305.NonceSize
+	if len(ciphertext) < nonceSize {
+		err = errors.New("ciphertext is too short")
+		return
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return decryptByteChacha20poly1305(key, nonce, ciphertext, additionalData)
+}
+
+// encryptByteXChacha20poly1305 is the shared XChaCha20-Poly1305 encryption core.
+// It seals input under key with a fresh random 192-bit nonce and additionally
+// authenticates additionalData (which may be nil).
+func encryptByteXChacha20poly1305(key, input, additionalData []byte) (ciphertext []byte, nonce []byte, err error) {
 	// create a new XChaCha20-Poly1305 AEAD using the given 256-bit key
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
@@ -136,8 +170,34 @@ func EncryptByteXChacha20poly1305(key []byte, input []byte) (ciphertext []byte, 
 	}
 
 	// encrypt the data
-	ciphertext = aead.Seal(nil, nonce, input, nil)
+	ciphertext = aead.Seal(nil, nonce, input, additionalData)
 	return
+}
+
+// decryptByteXChacha20poly1305 is the shared XChaCha20-Poly1305 decryption core.
+// additionalData must be the same value supplied at encryption (nil if none).
+func decryptByteXChacha20poly1305(key, nonce, ciphertext, additionalData []byte) (plaintext []byte, err error) {
+	// create a new XChaCha20-Poly1305 AEAD using the given 256-bit key
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// decrypt the data
+	plaintext, err = aead.Open(nil, nonce, ciphertext, additionalData)
+	if err != nil {
+		err = fmt.Errorf("error decrypting data: %v", err)
+		return
+	}
+
+	return
+}
+
+// EncryptByteXChacha20poly1305 encrypts and authenticates the given message (bytes) with
+// XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce.
+func EncryptByteXChacha20poly1305(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
+	return encryptByteXChacha20poly1305(key, input, nil)
 }
 
 // EncryptXChacha20poly1305 encrypts and authenticates the given message (string) with
@@ -149,21 +209,7 @@ func EncryptXChacha20poly1305(key []byte, text string) (ciphertext []byte, nonce
 // DecryptByteXChacha20poly1305 decrypts and authenticates the given ciphertext with
 // XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce.
 func DecryptByteXChacha20poly1305(key, nonce, ciphertext []byte) (plaintext []byte, err error) {
-	// create a new XChaCha20-Poly1305 AEAD using the given 256-bit key
-	aead, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		err = fmt.Errorf("error creating AEAD: %v", err)
-		return
-	}
-
-	// decrypt the data
-	plaintext, err = aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		err = fmt.Errorf("error decrypting data: %v", err)
-		return
-	}
-
-	return
+	return decryptByteXChacha20poly1305(key, nonce, ciphertext, nil)
 }
 
 // DecryptXChacha20poly1305 decrypts and authenticates the given ciphertext with
@@ -183,12 +229,7 @@ func DecryptXChacha20poly1305(key, nonce, ciphertext []byte) (text string, err e
 // XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce.
 // It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
 func EncryptByteXChacha20poly1305WithNonceAppended(key []byte, input []byte) (ciphertext []byte, err error) {
-	ciphertext, nonce, err := EncryptByteXChacha20poly1305(key, input)
-	if err != nil {
-		return
-	}
-	ciphertext = append(nonce, ciphertext...)
-	return
+	return EncryptByteXChacha20poly1305WithNonceAppendedAAD(key, input, nil)
 }
 
 // EncryptXChacha20poly1305WithNonceAppended encrypts and authenticates the given message (string) with
@@ -202,14 +243,7 @@ func EncryptXChacha20poly1305WithNonceAppended(key []byte, text string) (ciphert
 // XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce.
 // It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
 func DecryptByteXChacha20poly1305WithNonceAppended(key, ciphertext []byte) (plaintext []byte, err error) {
-	nonceSize := chacha20poly1305.NonceSizeX
-	if len(ciphertext) < nonceSize {
-		err = errors.New("ciphertext is too short")
-		return
-	}
-
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return DecryptByteXChacha20poly1305(key, nonce, ciphertext)
+	return DecryptByteXChacha20poly1305WithNonceAppendedAAD(key, ciphertext, nil)
 }
 
 // DecryptXChacha20poly1305WithNonceAppended decrypts and authenticates the given ciphertext with
@@ -223,4 +257,37 @@ func DecryptXChacha20poly1305WithNonceAppended(key, ciphertext []byte) (text str
 
 	text = string(plaintext)
 	return
+}
+
+// EncryptByteXChacha20poly1305WithNonceAppendedAAD encrypts and authenticates the given
+// message (bytes) with XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce,
+// and additionally authenticates additionalData (AAD). The AAD is neither encrypted nor
+// included in the output; the identical bytes must be supplied at decryption. A nil AAD
+// makes this equivalent to EncryptByteXChacha20poly1305WithNonceAppended.
+// It appends the ciphertext to the nonce [ciphertext = nonce + ciphertext].
+func EncryptByteXChacha20poly1305WithNonceAppendedAAD(key, input, additionalData []byte) (ciphertext []byte, err error) {
+	ciphertext, nonce, err := encryptByteXChacha20poly1305(key, input, additionalData)
+	if err != nil {
+		return
+	}
+
+	ciphertext = append(nonce, ciphertext...)
+	return
+}
+
+// DecryptByteXChacha20poly1305WithNonceAppendedAAD decrypts and authenticates the given
+// ciphertext with XChaCha20-Poly1305 AEAD using the given 256-bit key and 192-bit nonce,
+// verifying additionalData (AAD) against the value supplied at encryption. Decryption
+// fails if the AAD differs. A nil AAD makes this equivalent to
+// DecryptByteXChacha20poly1305WithNonceAppended.
+// It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
+func DecryptByteXChacha20poly1305WithNonceAppendedAAD(key, ciphertext, additionalData []byte) (plaintext []byte, err error) {
+	nonceSize := chacha20poly1305.NonceSizeX
+	if len(ciphertext) < nonceSize {
+		err = errors.New("ciphertext is too short")
+		return
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return decryptByteXChacha20poly1305(key, nonce, ciphertext, additionalData)
 }

@@ -145,7 +145,9 @@ func main() {
 	// Bootstrap: derive a key-encryption key (KEK) from a rotatable secret,
 	// then generate a master key and store it *wrapped*. (Errors omitted
 	// for brevity; handle them in real code.)
-	kek, _ := scheme.DeriveKEK(os.Getenv("ENCRYPTION_SECRET")) // >= 32 chars
+	// The secret must be machine-generated randomness, >= 32 chars
+	// (e.g. `openssl rand -hex 32`), never a human-chosen passphrase.
+	kek, _ := scheme.DeriveKEK(os.Getenv("ENCRYPTION_SECRET"))
 	masterKey, _ := envelope.GenerateMasterKey()
 	wrapped, _ := envelope.WrapKey(kek, masterKey) // persist `wrapped`, not masterKey
 	_ = wrapped
@@ -155,11 +157,19 @@ func main() {
 	plain, _ := scheme.OpenString(masterKey, token)
 
 	fmt.Println(plain) // top secret
+
+	// Optional context binding: authenticate the record/field the token
+	// belongs to, so valid tokens cannot be swapped between rows.
+	bound, _ := scheme.SealStringAAD(masterKey, "top secret", []byte("user:42:note"))
+	_, err := scheme.OpenStringAAD(masterKey, bound, []byte("user:7:note"))
+	fmt.Println(err != nil) // wrong context fails to decrypt
 }
 ```
 
 Under the hood every item gets a fresh per-item sub-key (HKDF) and its own
 random nonce, so a nonce can never repeat under the same key.
+The envelope header is authenticated, and every `Seal*`/`Open*` function
+has an `AAD` variant that additionally authenticates caller-supplied context.
 
 ## Choosing an algorithm
 
@@ -179,7 +189,11 @@ random nonce, so a nonce can never repeat under the same key.
 | XChaCha20-Poly1305 (`chaCha20.go`) | `EncryptXChacha20poly1305` / `DecryptXChacha20poly1305` (192-bit nonce) |
 | RSA-OAEP (`rsa.go`) | `Encoder.EncryptRSA` / `Decoder.DecryptRSA` (+ `Byte` variants) |
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
-| Envelope (`envelope/`) | `Scheme.Seal*`/`Open*`, `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Sha256Hex`, `RandomHex` |
+| Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
+
+The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
+`...AAD` forms that bind caller-supplied associated data (authenticated, not
+encrypted) into the ciphertext.
 
 Full, always-current reference lives on
 [pkg.go.dev](https://pkg.go.dev/github.com/pilinux/crypt).
@@ -227,6 +241,10 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
 - **Bring your own key derivation.** `crypt` encrypts with the key you give it;
   it never derives one. Use Argon2id for passwords and HKDF for high-entropy
   secrets (the `envelope` subpackage does the latter for you).
+- **The envelope secret must be machine-generated.** `DeriveKEK` uses HKDF,
+  which does no password stretching: generate `ENCRYPTION_SECRET` with
+  `openssl rand -hex 32` (or similar) and never use a human-chosen passphrase.
+  A guessable secret can be brute-forced offline from the wrapped master key.
 - **Key sizes.** AES accepts 16/24/32-byte keys; ChaCha20 and XChaCha20 require
   exactly 32 bytes.
 - **Never reuse a (key, nonce) pair.** Nonces come from `crypto/rand`. When

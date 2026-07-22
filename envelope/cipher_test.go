@@ -137,6 +137,68 @@ func TestSealOpenBytes(t *testing.T) {
 			t.Error("OpenBytes of tampered envelope succeeded, want failure")
 		}
 	})
+
+	t.Run("tamperHeaderFails", func(t *testing.T) {
+		// flipping the saltLen byte (1) or a salt byte (2) must fail: the
+		// header is authenticated as AAD (and the salt drives the sub-key).
+		for _, idx := range []int{1, 2} {
+			blob, _ := s.SealBytes(masterKey, []byte("secret"))
+			blob[idx] ^= 0x01
+			if _, err := s.OpenBytes(masterKey, blob); err == nil {
+				t.Errorf("OpenBytes after flipping header byte %d succeeded, want failure", idx)
+			}
+		}
+	})
+
+	t.Run("tamperVersionFails", func(t *testing.T) {
+		blob, _ := s.SealBytes(masterKey, []byte("secret"))
+		blob[0] ^= 0xFF
+		if _, err := s.OpenBytes(masterKey, blob); err != ErrBadEnvelope {
+			t.Errorf("err = %v, want ErrBadEnvelope", err)
+		}
+	})
+}
+
+func TestSealOpenBytesAAD(t *testing.T) {
+	s := Default()
+	masterKey := newMasterKey(t)
+	plaintext := []byte("bound to user 42")
+	aad := []byte("user:42:ssn")
+
+	t.Run("roundTrip", func(t *testing.T) {
+		blob, err := s.SealBytesAAD(masterKey, plaintext, aad)
+		if err != nil {
+			t.Fatalf("SealBytesAAD error: %v", err)
+		}
+		got, err := s.OpenBytesAAD(masterKey, blob, aad)
+		if err != nil {
+			t.Fatalf("OpenBytesAAD error: %v", err)
+		}
+		if !bytes.Equal(got, plaintext) {
+			t.Errorf("round-trip mismatch: got %q, want %q", got, plaintext)
+		}
+	})
+
+	t.Run("wrongAADFails", func(t *testing.T) {
+		blob, _ := s.SealBytesAAD(masterKey, plaintext, aad)
+		if _, err := s.OpenBytesAAD(masterKey, blob, []byte("user:7:ssn")); err == nil {
+			t.Error("OpenBytesAAD with wrong AAD succeeded, want failure")
+		}
+	})
+
+	t.Run("missingAADFails", func(t *testing.T) {
+		blob, _ := s.SealBytesAAD(masterKey, plaintext, aad)
+		if _, err := s.OpenBytes(masterKey, blob); err == nil {
+			t.Error("OpenBytes of AAD-bound envelope succeeded, want failure")
+		}
+	})
+
+	t.Run("unexpectedAADFails", func(t *testing.T) {
+		blob, _ := s.SealBytes(masterKey, plaintext)
+		if _, err := s.OpenBytesAAD(masterKey, blob, aad); err == nil {
+			t.Error("OpenBytesAAD of AAD-less envelope succeeded, want failure")
+		}
+	})
 }
 
 func TestSealOpenString(t *testing.T) {
@@ -162,6 +224,24 @@ func TestSealOpenString(t *testing.T) {
 	t.Run("badBase64", func(t *testing.T) {
 		if _, err := s.OpenString(masterKey, "not valid base64!!!"); err != ErrBadEnvelope {
 			t.Errorf("err = %v, want ErrBadEnvelope", err)
+		}
+	})
+
+	t.Run("aadRoundTripAndMismatch", func(t *testing.T) {
+		aad := []byte("user:42:email")
+		token, err := s.SealStringAAD(masterKey, "alice@example.com", aad)
+		if err != nil {
+			t.Fatalf("SealStringAAD error: %v", err)
+		}
+		got, err := s.OpenStringAAD(masterKey, token, aad)
+		if err != nil {
+			t.Fatalf("OpenStringAAD error: %v", err)
+		}
+		if got != "alice@example.com" {
+			t.Errorf("round-trip mismatch: got %q", got)
+		}
+		if _, err := s.OpenStringAAD(masterKey, token, []byte("user:7:email")); err == nil {
+			t.Error("OpenStringAAD with wrong AAD succeeded, want failure")
 		}
 	})
 }
@@ -193,13 +273,48 @@ func TestSealOpenInt64(t *testing.T) {
 
 	t.Run("nonIntegerPlaintext", func(t *testing.T) {
 		// a string-sealed token opened as int64 must fail with the generic
-		// error; the strconv error would leak the decrypted plaintext.
+		// error; anything but the fixed 8-byte encoding is rejected.
 		token, err := s.SealString(masterKey, "not a number")
 		if err != nil {
 			t.Fatalf("SealString error: %v", err)
 		}
 		if _, err := s.OpenInt64(masterKey, token); err != ErrNotAnInteger {
 			t.Errorf("err = %v, want ErrNotAnInteger", err)
+		}
+	})
+
+	t.Run("uniformTokenLength", func(t *testing.T) {
+		// the fixed-width encoding must hide the magnitude of the value:
+		// every int64 token has exactly the same length.
+		want := -1
+		for _, n := range []int64{0, 7, -1, 9223372036854775807, -9223372036854775808} {
+			token, err := s.SealInt64(masterKey, n)
+			if err != nil {
+				t.Fatalf("SealInt64(%d) error: %v", n, err)
+			}
+			if want == -1 {
+				want = len(token)
+			} else if len(token) != want {
+				t.Errorf("token for %d has len %d, want %d", n, len(token), want)
+			}
+		}
+	})
+
+	t.Run("aadRoundTripAndMismatch", func(t *testing.T) {
+		aad := []byte("user:42:age")
+		token, err := s.SealInt64AAD(masterKey, -37, aad)
+		if err != nil {
+			t.Fatalf("SealInt64AAD error: %v", err)
+		}
+		got, err := s.OpenInt64AAD(masterKey, token, aad)
+		if err != nil {
+			t.Fatalf("OpenInt64AAD error: %v", err)
+		}
+		if got != -37 {
+			t.Errorf("round-trip mismatch: got %d, want -37", got)
+		}
+		if _, err := s.OpenInt64AAD(masterKey, token, []byte("user:7:age")); err == nil {
+			t.Error("OpenInt64AAD with wrong AAD succeeded, want failure")
 		}
 	})
 }

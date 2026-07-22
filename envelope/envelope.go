@@ -7,7 +7,8 @@
 // # Two-layer (envelope) key model
 //
 //   - KEK (key-encryption key): derived from a high-entropy application secret
-//     (typically an ENCRYPTION_SECRET env value) via HKDF-SHA256. It never
+//     (typically an ENCRYPTION_SECRET env value; machine-generated, never a
+//     human-chosen passphrase) via HKDF-SHA256. It never
 //     encrypts user data directly; it only wraps (encrypts) the master key.
 //     Rotating the secret therefore means re-wrapping a single stored value
 //     instead of re-encrypting every record. See [Scheme.DeriveKEK], [WrapKey]
@@ -46,6 +47,29 @@
 //	│ version │ saltLen  │ salt         │ XChaCha20-Poly1305 (nonce||AEAD)   │
 //	│ 1 byte  │ 1 byte   │ saltLen byte │ 24-byte nonce + ciphertext + tag   │
 //	└─────────┴──────────┴──────────────┴───────────────────────────────────┘
+//
+// The header (version, saltLen, salt) is authenticated as AEAD additional
+// data, so not a single header byte can be altered without decryption
+// failing.
+//
+// # Context binding (AAD)
+//
+// Every Seal/Open function has an AAD variant ([Scheme.SealBytesAAD],
+// [Scheme.OpenStringAAD], ...) that additionally authenticates a
+// caller-supplied byte string, for example a record ID or field name. Two
+// tokens sealed under the same master key but different AAD are not
+// interchangeable: opening with the wrong (or a missing) AAD fails. Use this
+// to stop an attacker with write access to the datastore from swapping valid
+// tokens between rows or fields. The plain variants are shorthand for a nil
+// AAD; the envelope header is authenticated either way.
+//
+// # Key hygiene
+//
+// [Zero] wipes key material once it is no longer needed. The scheme wipes
+// every internally derived per-item sub-key itself; wiping the KEK and the
+// unwrapped master key is the caller's job, since only the caller knows their
+// lifetime. Wiping is best effort: the runtime or cipher internals may hold
+// transient copies that cannot be reached from Go code.
 package envelope
 
 import (
@@ -70,6 +94,11 @@ const (
 
 	// MinSecretLength is the minimum accepted length of the application secret
 	// passed to [Scheme.DeriveKEK]. A shorter secret is rejected outright.
+	//
+	// The length check is a floor, not a measure of quality: the secret must
+	// be machine-generated randomness (e.g. `openssl rand -hex 32`), never a
+	// human-chosen passphrase, because KEK derivation applies no password
+	// stretching.
 	MinSecretLength = 32
 )
 
@@ -88,6 +117,8 @@ const (
 const (
 	// envelopeVersion tags the envelope format so an unknown or legacy blob is
 	// rejected explicitly instead of being decrypted with wrong assumptions.
+	// Version 0x01 (current): the header is authenticated as AEAD additional
+	// data and int64 values are sealed in fixed-width 8-byte big-endian form.
 	envelopeVersion byte = 0x01
 
 	// envelopeHeaderSize is the fixed part of the envelope header: the version
@@ -111,9 +142,9 @@ var (
 	ErrBadEnvelope = errors.New("envelope: malformed ciphertext envelope")
 
 	// ErrNotAnInteger is returned by [Scheme.OpenInt64] when the token decrypts
-	// successfully but its plaintext is not a base-10 integer. The underlying
-	// strconv error is deliberately discarded because it would embed the
-	// decrypted plaintext in the error message.
+	// successfully but its plaintext is not the fixed-width 8-byte encoding
+	// produced by [Scheme.SealInt64] (for example a token that was sealed by
+	// [Scheme.SealString]).
 	ErrNotAnInteger = errors.New("envelope: sealed value is not an integer")
 )
 
@@ -165,46 +196,63 @@ func randomBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
-// packEnvelope assembles the on-the-wire envelope from a salt and the
-// XChaCha20-Poly1305 ciphertext (which already carries its nonce prepended).
-func packEnvelope(salt, ciphertext []byte) ([]byte, error) {
+// buildHeader assembles the envelope header (version || saltLen || salt) for
+// the given salt. The header is stored in the clear at the start of the
+// envelope and is also fed to the AEAD as (the leading part of) its
+// additional data, so none of its bytes can be altered without decryption
+// failing.
+func buildHeader(salt []byte) ([]byte, error) {
 	if len(salt) == 0 || len(salt) > 255 {
 		return nil, ErrInvalidSaltSize
 	}
 
-	out := make([]byte, envelopeHeaderSize+len(salt)+len(ciphertext))
-	out[0] = envelopeVersion
+	header := make([]byte, envelopeHeaderSize+len(salt))
+	header[0] = envelopeVersion
 	// the salt length is guaranteed to be in 1..255 by the guard above, so the
 	// conversion to a single byte cannot overflow.
-	out[1] = byte(len(salt)) // #nosec G115
-	copy(out[envelopeHeaderSize:], salt)
-	copy(out[envelopeHeaderSize+len(salt):], ciphertext)
-	return out, nil
+	header[1] = byte(len(salt)) // #nosec G115
+	copy(header[envelopeHeaderSize:], salt)
+	return header, nil
 }
 
-// unpackEnvelope splits an envelope back into its salt and ciphertext. It
-// rejects any blob whose version byte or length does not match the format.
-func unpackEnvelope(blob []byte) (salt, ciphertext []byte, err error) {
+// authData returns the byte string authenticated (but not encrypted) by the
+// AEAD: the envelope header followed by the caller-supplied AAD. A nil or
+// empty aad authenticates the header alone.
+func authData(header, aad []byte) []byte {
+	if len(aad) == 0 {
+		return header
+	}
+
+	out := make([]byte, 0, len(header)+len(aad))
+	out = append(out, header...)
+	return append(out, aad...)
+}
+
+// unpackEnvelope splits an envelope back into its header, salt and
+// ciphertext (all aliasing blob). It rejects any blob whose version byte or
+// length does not match the format.
+func unpackEnvelope(blob []byte) (header, salt, ciphertext []byte, err error) {
 	if len(blob) < envelopeHeaderSize {
-		return nil, nil, ErrBadEnvelope
+		return nil, nil, nil, ErrBadEnvelope
 	}
 	if blob[0] != envelopeVersion {
-		return nil, nil, ErrBadEnvelope
+		return nil, nil, nil, ErrBadEnvelope
 	}
 
 	saltLen := int(blob[1])
 	if saltLen == 0 {
-		return nil, nil, ErrBadEnvelope
+		return nil, nil, nil, ErrBadEnvelope
 	}
 
 	// the blob must hold the header, the full salt and at least a
 	// nonce + tag worth of ciphertext, otherwise it cannot be authentic.
 	minLen := envelopeHeaderSize + saltLen + NonceSize + TagSize
 	if len(blob) < minLen {
-		return nil, nil, ErrBadEnvelope
+		return nil, nil, nil, ErrBadEnvelope
 	}
 
-	salt = blob[envelopeHeaderSize : envelopeHeaderSize+saltLen]
+	header = blob[:envelopeHeaderSize+saltLen]
+	salt = header[envelopeHeaderSize:]
 	ciphertext = blob[envelopeHeaderSize+saltLen:]
-	return salt, ciphertext, nil
+	return header, salt, ciphertext, nil
 }
