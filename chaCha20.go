@@ -8,6 +8,16 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// Maximum message sizes accepted by the ChaCha20-Poly1305 variants. Above
+// these bounds x/crypto's Seal/Open panic ("plaintext too large" /
+// "ciphertext too large"); we reject such inputs with an error instead. Both
+// the standard and X variants share the same limits (~256 GiB), far above any
+// practical payload. The values mirror the library's own guards.
+const (
+	chachaMaxPlaintextSize  uint64 = (1 << 38) - 64 // 256 GiB - 64 bytes
+	chachaMaxCiphertextSize uint64 = (1 << 38) - 48 // 256 GiB - 48 bytes
+)
+
 // encryptByteChacha20poly1305 is the shared ChaCha20-Poly1305 encryption core.
 // It seals input under key with a fresh random 96-bit nonce and additionally
 // authenticates additionalData (which may be nil).
@@ -16,6 +26,12 @@ func encryptByteChacha20poly1305(key, input, additionalData []byte) (ciphertext 
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
 		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// reject oversized input so Seal returns an error rather than panicking
+	if uint64(len(input)) > chachaMaxPlaintextSize {
+		err = errors.New("plaintext too large")
 		return
 	}
 
@@ -39,6 +55,17 @@ func decryptByteChacha20poly1305(key, nonce, ciphertext, additionalData []byte) 
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
 		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// reject a wrong-length nonce or oversized ciphertext so Open returns an
+	// error rather than panicking on caller-supplied input
+	if len(nonce) != aead.NonceSize() {
+		err = errors.New("invalid nonce length")
+		return
+	}
+	if uint64(len(ciphertext)) > chachaMaxCiphertextSize {
+		err = errors.New("ciphertext too large")
 		return
 	}
 
@@ -161,6 +188,12 @@ func encryptByteXChacha20poly1305(key, input, additionalData []byte) (ciphertext
 		return
 	}
 
+	// reject oversized input so Seal returns an error rather than panicking
+	if uint64(len(input)) > chachaMaxPlaintextSize {
+		err = errors.New("plaintext too large")
+		return
+	}
+
 	// generate a 192-bit random nonce
 	nonce = make([]byte, aead.NonceSize())
 	_, err = rand.Read(nonce)
@@ -181,6 +214,17 @@ func decryptByteXChacha20poly1305(key, nonce, ciphertext, additionalData []byte)
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// reject a wrong-length nonce or oversized ciphertext so Open returns an
+	// error rather than panicking on caller-supplied input
+	if len(nonce) != aead.NonceSize() {
+		err = errors.New("invalid nonce length")
+		return
+	}
+	if uint64(len(ciphertext)) > chachaMaxCiphertextSize {
+		err = errors.New("ciphertext too large")
 		return
 	}
 

@@ -8,6 +8,16 @@ import (
 	"fmt"
 )
 
+// Maximum message sizes accepted by AES-GCM with the standard 96-bit nonce.
+// Above these bounds crypto/cipher's Seal/Open panic ("message too large for
+// GCM"); we reject such inputs with an error instead. The limit (~64 GiB) is
+// far above any practical payload and mirrors the stdlib's own guard
+// (((1<<32)-2) blocks of 16 bytes, plus the 16-byte tag for ciphertext).
+const (
+	gcmMaxPlaintextSize  uint64 = ((1 << 32) - 2) * 16 // 64 GiB - 32 bytes
+	gcmMaxCiphertextSize uint64 = ((1<<32)-2)*16 + 16  // 64 GiB - 16 bytes
+)
+
 // EncryptByteAesGcm encrypts and authenticates the given message (bytes) with AES in GCM mode
 // using the given 128, 192 or 256-bit key.
 func EncryptByteAesGcm(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
@@ -24,6 +34,12 @@ func EncryptByteAesGcm(key []byte, input []byte) (ciphertext []byte, nonce []byt
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
 		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// reject oversized input so Seal returns an error rather than panicking
+	if uint64(len(input)) > gcmMaxPlaintextSize {
+		err = errors.New("plaintext too large")
 		return
 	}
 
@@ -63,6 +79,17 @@ func DecryptByteAesGcm(key, nonce, ciphertext []byte) (plaintext []byte, err err
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
 		err = fmt.Errorf("error creating AEAD: %v", err)
+		return
+	}
+
+	// reject a wrong-length nonce or oversized ciphertext so Open returns an
+	// error rather than panicking on caller-supplied input
+	if len(nonce) != aead.NonceSize() {
+		err = errors.New("invalid nonce length")
+		return
+	}
+	if uint64(len(ciphertext)) > gcmMaxCiphertextSize {
+		err = errors.New("ciphertext too large")
 		return
 	}
 

@@ -171,4 +171,23 @@ func TestAesGcmErrors(t *testing.T) {
 			t.Error("expected error for too-short ciphertext, got nil")
 		}
 	})
+
+	t.Run("wrongNonceLength", func(t *testing.T) {
+		// a wrong-length nonce must return an error, not panic:
+		// the test binary would crash on an unrecovered panic.
+		ciphertext, nonce, err := EncryptByteAesGcm(key, []byte("secret"))
+		if err != nil {
+			t.Fatalf("encrypt: %v", err)
+		}
+		const nonceSize = 12 // AES-GCM standard nonce
+		for _, badLen := range []int{0, nonceSize - 1, nonceSize + 1} {
+			if _, err := DecryptByteAesGcm(key, make([]byte, badLen), ciphertext); err == nil {
+				t.Errorf("decrypt with %d-byte nonce succeeded, want error", badLen)
+			}
+		}
+		// the correct length still round-trips
+		if _, err := DecryptByteAesGcm(key, nonce, ciphertext); err != nil {
+			t.Errorf("decrypt with correct nonce failed: %v", err)
+		}
+	})
 }

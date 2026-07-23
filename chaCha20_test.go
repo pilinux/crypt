@@ -247,6 +247,24 @@ func TestChacha20Errors(t *testing.T) {
 					t.Error("expected error for too-short ciphertext, got nil")
 				}
 			})
+
+			t.Run("wrongNonceLength", func(t *testing.T) {
+				// a wrong-length nonce must return an error, not panic:
+				// the test binary would crash on an unrecovered panic.
+				ciphertext, nonce, err := a.encByte(key, []byte("secret"))
+				if err != nil {
+					t.Fatalf("encrypt: %v", err)
+				}
+				for _, badLen := range []int{0, a.nonceSize - 1, a.nonceSize + 1} {
+					if _, err := a.decByte(key, make([]byte, badLen), ciphertext); err == nil {
+						t.Errorf("decrypt with %d-byte nonce succeeded, want error", badLen)
+					}
+				}
+				// the correct length still round-trips
+				if _, err := a.decByte(key, nonce, ciphertext); err != nil {
+					t.Errorf("decrypt with correct nonce failed: %v", err)
+				}
+			})
 		})
 	}
 }

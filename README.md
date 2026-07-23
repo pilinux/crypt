@@ -252,6 +252,14 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   `envelope` scheme, which give each item its own key or a large random nonce.
 - **Everything is authenticated.** All AEAD modes and RSA-OAEP fail closed:
   tampered ciphertext or a wrong key returns an error, never partial plaintext.
+- **Fail closed on bad input, never panic.** The `Decrypt…` functions that take
+  a nonce directly validate its length (12 bytes for AES-GCM and
+  ChaCha20-Poly1305, 24 for XChaCha20-Poly1305) and return an error on a
+  mismatch instead of letting the underlying cipher panic.
+- **Per-message size limit.** A single message is capped by the underlying
+  AEAD: roughly **256 GiB** for ChaCha20/XChaCha20-Poly1305 and **64 GiB** for
+  AES-GCM. Anything larger returns an error rather than panicking. These bounds
+  sit far above any realistic payload; stream or chunk data that big.
 - **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
   private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after
   `NewEncoder` / `NewDecoder`.
