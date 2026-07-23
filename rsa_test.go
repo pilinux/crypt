@@ -138,6 +138,20 @@ func TestRSAErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("unsupportedHash", func(t *testing.T) {
+		enc := NewEncoder(pubPEM)
+		enc.HashAlg = HashAlgorithm(99) // not SHA256/SHA512
+		if _, err := enc.EncryptRSA("Hello world"); err == nil {
+			t.Error("encrypt with unsupported hash succeeded, want failure")
+		}
+
+		dec := NewDecoder(privPEM)
+		dec.HashAlg = HashAlgorithm(99)
+		if _, err := dec.DecryptRSA([]byte("whatever")); err == nil {
+			t.Error("decrypt with unsupported hash succeeded, want failure")
+		}
+	})
+
 	t.Run("wrongKey", func(t *testing.T) {
 		enc := NewEncoder(pubPEM)
 		_, otherPriv := testRSAKeyPair(t)

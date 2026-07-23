@@ -4,9 +4,30 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	_ "crypto/sha256" // link SHA-256 so crypto.SHA256.New() never panics
+	_ "crypto/sha512" // link SHA-512 so crypto.SHA512.New() never panics
 	"crypto/x509"
 	"fmt"
 )
+
+// hash resolves the HashAlgorithm to a crypto.Hash for RSA-OAEP. It rejects
+// unknown values instead of silently defaulting to SHA-256, and verifies the
+// implementation is linked into the binary so a later New() call cannot panic.
+func (h HashAlgorithm) hash() (crypto.Hash, error) {
+	var alg crypto.Hash
+	switch h {
+	case SHA256:
+		alg = crypto.SHA256
+	case SHA512:
+		alg = crypto.SHA512
+	default:
+		return 0, fmt.Errorf("unsupported hash algorithm: %d", int(h))
+	}
+	if !alg.Available() {
+		return 0, fmt.Errorf("hash algorithm %v is not linked into the binary", alg)
+	}
+	return alg, nil
+}
 
 // EncryptByteRSA encrypts the given message (bytes) with RSA-OAEP and using SHA-256 (default) or SHA-512.
 func (e *Encoder) EncryptByteRSA(input []byte) (ciphertext []byte, err error) {
@@ -22,12 +43,9 @@ func (e *Encoder) EncryptByteRSA(input []byte) (ciphertext []byte, err error) {
 		return
 	}
 
-	var hashAlg crypto.Hash
-	switch e.HashAlg {
-	case SHA512:
-		hashAlg = crypto.SHA512
-	default:
-		hashAlg = crypto.SHA256
+	hashAlg, err := e.HashAlg.hash()
+	if err != nil {
+		return
 	}
 
 	// encrypt the data using RSA-OAEP
@@ -65,18 +83,16 @@ func (d *Decoder) DecryptByteRSA(ciphertext []byte) (plaintext []byte, err error
 		return
 	}
 
-	var hashAlg crypto.Hash
-	switch d.HashAlg {
-	case SHA512:
-		hashAlg = crypto.SHA512
-	default:
-		hashAlg = crypto.SHA256
+	hashAlg, err := d.HashAlg.hash()
+	if err != nil {
+		return
 	}
 
-	// decrypt the data using RSA-OAEP
+	// decrypt the data using RSA-OAEP; DecryptOAEP ignores the random
+	// argument (it is legacy), so nil documents that intent.
 	plaintext, err = rsa.DecryptOAEP(
 		hashAlg.New(),
-		rand.Reader,
+		nil,
 		rsaPriKey,
 		ciphertext,
 		nil,
