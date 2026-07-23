@@ -20,6 +20,10 @@ func mustBytes(t *testing.T, n int) []byte {
 // aesKeySizes maps a human name to the key length that selects each AES variant.
 var aesKeySizes = map[string]int{"AES-128": 16, "AES-192": 24, "AES-256": 32}
 
+// aesGcmNonceSize is AES-GCM's standard nonce length. The tests assert against
+// this known-answer value rather than deriving it from the cipher.
+const aesGcmNonceSize = 12
+
 func TestAesGcmRoundTrip(t *testing.T) {
 	const text = "the quick brown fox jumps over the lazy dog"
 
@@ -64,8 +68,7 @@ func TestAesGcmRoundTrip(t *testing.T) {
 
 func TestAesGcmWithNonceAppended(t *testing.T) {
 	const text = "attack at dawn"
-	const nonceSize = 12 // AES-GCM standard nonce
-	const tagSize = 16   // GCM authentication tag
+	const tagSize = 16 // GCM authentication tag
 
 	for name, size := range aesKeySizes {
 		t.Run(name, func(t *testing.T) {
@@ -76,7 +79,7 @@ func TestAesGcmWithNonceAppended(t *testing.T) {
 				if err != nil {
 					t.Fatalf("EncryptAesGcmWithNonceAppended: %v", err)
 				}
-				if want := nonceSize + len(text) + tagSize; len(ciphertext) != want {
+				if want := aesGcmNonceSize + len(text) + tagSize; len(ciphertext) != want {
 					t.Errorf("ciphertext len = %d, want %d (nonce+plaintext+tag)", len(ciphertext), want)
 				}
 				got, err := DecryptAesGcmWithNonceAppended(key, ciphertext)
@@ -179,8 +182,7 @@ func TestAesGcmErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encrypt: %v", err)
 		}
-		const nonceSize = 12 // AES-GCM standard nonce
-		for _, badLen := range []int{0, nonceSize - 1, nonceSize + 1} {
+		for _, badLen := range []int{0, aesGcmNonceSize - 1, aesGcmNonceSize + 1} {
 			if _, err := DecryptByteAesGcm(key, make([]byte, badLen), ciphertext); err == nil {
 				t.Errorf("decrypt with %d-byte nonce succeeded, want error", badLen)
 			}

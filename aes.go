@@ -18,22 +18,29 @@ const (
 	gcmMaxCiphertextSize uint64 = ((1<<32)-2)*16 + 16  // 64 GiB - 16 bytes
 )
 
-// EncryptByteAesGcm encrypts and authenticates the given message (bytes) with AES in GCM mode
-// using the given 128, 192 or 256-bit key.
-func EncryptByteAesGcm(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
-	// create a new AES cipher block
+// aesGCM builds an AES-GCM AEAD for the given 128/192/256-bit key. It is the
+// single place the cipher is constructed, so every AES-GCM operation shares
+// the same nonce size (and its error handling) instead of hard-coding it.
+func aesGCM(key []byte) (cipher.AEAD, error) {
 	// the key argument should be the AES key, either 16, 24, or 32 bytes
 	// to select AES-128, AES-192, or AES-256
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		err = fmt.Errorf("error creating cipher.Block: %v", err)
-		return
+		return nil, fmt.Errorf("error creating cipher.Block: %v", err)
 	}
 
-	// create a GCM cipher instance
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		err = fmt.Errorf("error creating AEAD: %v", err)
+		return nil, fmt.Errorf("error creating AEAD: %v", err)
+	}
+	return aead, nil
+}
+
+// EncryptByteAesGcm encrypts and authenticates the given message (bytes) with AES in GCM mode
+// using the given 128, 192 or 256-bit key.
+func EncryptByteAesGcm(key []byte, input []byte) (ciphertext []byte, nonce []byte, err error) {
+	aead, err := aesGCM(key)
+	if err != nil {
 		return
 	}
 
@@ -43,7 +50,7 @@ func EncryptByteAesGcm(key []byte, input []byte) (ciphertext []byte, nonce []byt
 		return
 	}
 
-	// generate a 96-bit random nonce
+	// generate a random nonce of the AEAD's nonce size (96-bit for GCM)
 	nonce = make([]byte, aead.NonceSize())
 	_, err = rand.Read(nonce)
 	if err != nil {
@@ -63,27 +70,10 @@ func EncryptAesGcm(key []byte, text string) (ciphertext []byte, nonce []byte, er
 	return EncryptByteAesGcm(key, []byte(text))
 }
 
-// DecryptByteAesGcm decrypts and authenticates the given message with AES in GCM mode
-// using the given 128, 192 or 256-bit key and 96-bit nonce.
-func DecryptByteAesGcm(key, nonce, ciphertext []byte) (plaintext []byte, err error) {
-	// create a new AES cipher block
-	// the key argument should be the AES key, either 16, 24, or 32 bytes
-	// to select AES-128, AES-192, or AES-256
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		err = fmt.Errorf("error creating cipher.Block: %v", err)
-		return
-	}
-
-	// create a GCM cipher instance
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		err = fmt.Errorf("error creating AEAD: %v", err)
-		return
-	}
-
-	// reject a wrong-length nonce or oversized ciphertext so Open returns an
-	// error rather than panicking on caller-supplied input
+// decryptByteAesGcm is the shared AES-GCM decryption core operating on an
+// already-built AEAD. It rejects a wrong-length nonce or oversized ciphertext
+// so Open returns an error rather than panicking on caller-supplied input.
+func decryptByteAesGcm(aead cipher.AEAD, nonce, ciphertext []byte) (plaintext []byte, err error) {
 	if len(nonce) != aead.NonceSize() {
 		err = errors.New("invalid nonce length")
 		return
@@ -101,6 +91,16 @@ func DecryptByteAesGcm(key, nonce, ciphertext []byte) (plaintext []byte, err err
 	}
 
 	return
+}
+
+// DecryptByteAesGcm decrypts and authenticates the given message with AES in GCM mode
+// using the given 128, 192 or 256-bit key and 96-bit nonce.
+func DecryptByteAesGcm(key, nonce, ciphertext []byte) (plaintext []byte, err error) {
+	aead, err := aesGCM(key)
+	if err != nil {
+		return
+	}
+	return decryptByteAesGcm(aead, nonce, ciphertext)
 }
 
 // DecryptAesGcm decrypts and authenticates the given message with AES in GCM mode
@@ -140,14 +140,21 @@ func EncryptAesGcmWithNonceAppended(key []byte, text string) (ciphertext []byte,
 // using the given 128, 192 or 256-bit key.
 // It expects the ciphertext along with the nonce [ciphertext = nonce + ciphertext].
 func DecryptByteAesGcmWithNonceAppended(key, ciphertext []byte) (plaintext []byte, err error) {
-	nonceSize := 12
+	aead, err := aesGCM(key)
+	if err != nil {
+		return
+	}
+
+	// derive the split point from the AEAD so it always matches the nonce the
+	// encrypt side prepended, even if the GCM nonce size ever changes
+	nonceSize := aead.NonceSize()
 	if len(ciphertext) < nonceSize {
 		err = errors.New("ciphertext is too short")
 		return
 	}
 
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return DecryptByteAesGcm(key, nonce, ciphertext)
+	return decryptByteAesGcm(aead, nonce, ciphertext)
 }
 
 // DecryptAesGcmWithNonceAppended decrypts and authenticates the given ciphertext with AES in GCM mode
