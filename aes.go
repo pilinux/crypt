@@ -8,15 +8,13 @@ import (
 	"fmt"
 )
 
-// Maximum message sizes accepted by AES-GCM with the standard 96-bit nonce.
-// Above these bounds crypto/cipher's Seal/Open panic ("message too large for
-// GCM"); we reject such inputs with an error instead. The limit (~64 GiB) is
-// far above any practical payload and mirrors the stdlib's own guard
-// (((1<<32)-2) blocks of 16 bytes, plus the 16-byte tag for ciphertext).
-const (
-	gcmMaxPlaintextSize  uint64 = ((1 << 32) - 2) * 16 // 64 GiB - 32 bytes
-	gcmMaxCiphertextSize uint64 = ((1<<32)-2)*16 + 16  // 64 GiB - 16 bytes
-)
+// gcmMaxPlaintextSize is the largest plaintext AES-GCM will Seal before
+// crypto/cipher panics ("message too large for GCM"); EncryptByteAesGcm
+// rejects anything larger with an error instead. The limit (~64 GiB) is far
+// above any practical payload and mirrors the stdlib's own guard
+// (((1<<32)-2) blocks of 16 bytes). Decryption needs no equivalent: GCM's
+// Open returns an error on oversized ciphertext rather than panicking.
+const gcmMaxPlaintextSize uint64 = ((1 << 32) - 2) * 16 // 64 GiB - 32 bytes
 
 // aesGCM builds an AES-GCM AEAD for the given 128/192/256-bit key. It is the
 // single place the cipher is constructed, so every AES-GCM operation shares
@@ -71,15 +69,12 @@ func EncryptAesGcm(key []byte, text string) (ciphertext []byte, nonce []byte, er
 }
 
 // decryptByteAesGcm is the shared AES-GCM decryption core operating on an
-// already-built AEAD. It rejects a wrong-length nonce or oversized ciphertext
-// so Open returns an error rather than panicking on caller-supplied input.
+// already-built AEAD. It rejects a wrong-length nonce, which GCM's Open would
+// otherwise panic on. Oversized ciphertext needs no guard here: unlike
+// ChaCha20-Poly1305, GCM's Open returns an error rather than panicking.
 func decryptByteAesGcm(aead cipher.AEAD, nonce, ciphertext []byte) (plaintext []byte, err error) {
 	if len(nonce) != aead.NonceSize() {
 		err = errors.New("invalid nonce length")
-		return
-	}
-	if uint64(len(ciphertext)) > gcmMaxCiphertextSize {
-		err = errors.New("ciphertext too large")
 		return
 	}
 
