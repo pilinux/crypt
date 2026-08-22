@@ -13,6 +13,11 @@ can encrypt and decrypt data with well-established primitives without writing
 the fiddly plumbing yourself. Every function authenticates its output, generates
 nonces for you, and returns plain `[]byte` / `string` values.
 
+![Diagram: the four paths through the library, the two package layers, the naming pattern every cipher follows, and the house rules](crypt-overview.png)
+
+The whole library on one page: pick a path at the top, find the package and file
+it lives in, then the one naming pattern the ciphers share.
+
 ## Features
 
 - **AES-GCM**: AES-128/192/256 authenticated encryption.
