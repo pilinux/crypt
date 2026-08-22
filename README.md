@@ -23,6 +23,9 @@ nonces for you, and returns plain `[]byte` / `string` values.
 - **Base64 helpers**: Std, RawStd, URL and RawURL encoders/decoders.
 - **`envelope` subpackage**: a complete KEK/DEK envelope-encryption scheme for
   protecting many records under a single rotatable secret.
+- **Streaming**: chunked XChaCha20-Poly1305 for files that do not fit in
+  memory, with constant memory use and no size ceiling.
+- **Length hiding**: pad a file before sealing so its size stops identifying it.
 
 ## Install
 
@@ -171,6 +174,74 @@ random nonce, so a nonce can never repeat under the same key.
 The envelope header is authenticated, and every `Seal*`/`Open*` function
 has an `AAD` variant that additionally authenticates caller-supplied context.
 
+### Large files (streaming)
+
+`Seal*`/`Open*` hold the whole item in memory. For data that does not fit,
+such as a 10 GB backup, a 100 GB disk image or an upload of unknown length,
+the same scheme also streams, sealing one chunk at a time:
+
+```go
+// Whole files, in constant memory. The destination must not exist yet.
+n, err := scheme.SealFileAAD(masterKey, "backup.tar.enc", "backup.tar", []byte("backup.tar"))
+_, err = scheme.OpenFileAAD(masterKey, "restored.tar", "backup.tar.enc", []byte("backup.tar"))
+
+// Or plug into any io.Reader / io.Writer: HTTP bodies, S3 objects, pipes.
+_, err = scheme.SealStream(masterKey, w, r) // io.Writer <- io.Reader
+_, err = scheme.OpenStream(masterKey, w, r)
+
+// Or take the writer/reader themselves and compose freely.
+sw, err := scheme.SealWriter(masterKey, dst) // io.WriteCloser
+_, err = io.Copy(sw, src)
+err = sw.Close() // seals the final chunk; the stream is only complete after this
+
+sr, err := scheme.OpenReader(masterKey, src) // io.Reader
+_, err = io.Copy(dst, sr)
+```
+
+Each chunk (1 MiB by default, `Config.ChunkSize`) is sealed under the same
+per-stream sub-key with the nonce `noncePrefix || counter || finalFlag`, so
+chunks cannot be reordered, duplicated, dropped, or the stream cut short: a
+truncated file fails to open instead of decrypting to truncated plaintext.
+Every stream records its own chunk size, so changing `ChunkSize` later never
+orphans sealed data.
+
+**What it costs.** A stream holds exactly one chunk in memory whatever the
+input size, and that buffer is allocated once per stream and reused, so
+nothing is allocated per chunk: sealing a 100 GB file costs the same handful
+of allocations as sealing 1 KB. On the wire:
+
+```text
+sealed = 37 + plaintext + 16 * chunks     chunks = ceil(plaintext / ChunkSize), min 1
+```
+
+That is a 37-byte header plus one 16-byte tag per chunk, so a 10 GB file at
+the default 1 MiB chunk size grows by 160 KiB, about 0.0015%. Larger chunks
+mean less overhead and more memory per stream; smaller chunks the reverse.
+`MinChunkSize` (1 KiB) keeps the worst case under 2%, and `MaxChunkSize`
+(64 MiB) caps what a reader will allocate for a chunk size it read from an
+untrusted header.
+
+### Hiding the file length
+
+A sealed stream states its chunk size in the clear, so the exact plaintext
+length follows from the file size. `SealPaddedFile` pads the payload first,
+inside the encryption:
+
+```go
+n, err := scheme.SealPaddedFileAAD(masterKey, "doc.enc", "doc.pdf", []byte("doc"))
+_, err = scheme.OpenPaddedFileAAD(masterKey, "doc.out", "doc.enc", []byte("doc"))
+```
+
+The payload is framed as `version(1) || realLen(8) || payload || zero padding`
+and rounded up to a Padmé bucket (`PaddedSize`), destroying 12 to 25 bits of
+the length for about 1.4% extra storage. Measured over 162,524 real files: of
+those above 1 MB, 61% are uniquely identified by their exact size, 3.9% after
+padding. `OpenPaddedFile` reads the padding back and authenticates it before
+discarding it, so truncation inside the padding still fails.
+
+Only the length is hidden. File names, timestamps and access patterns leak
+independently; use `RandomHex` names if that matters.
+
 ## Choosing an algorithm
 
 | If you want to… | Reach for | Key |
@@ -179,6 +250,8 @@ has an `AAD` variant that additionally authenticates caller-supplied context.
 | Encrypt many messages under one key without nonce worries | **XChaCha20-Poly1305** | 32 bytes |
 | Let someone encrypt *to you* using your public key | **RSA-OAEP** | PEM key pair |
 | Protect many records under one rotatable secret | **`envelope`** subpackage | derived |
+| Encrypt a file too big to hold in memory | **`envelope`** streaming (`SealFile`, `SealWriter`) | derived |
+| Stop a file's size from identifying it | **`envelope`** padding (`SealPaddedFile`) | derived |
 
 ## API at a glance
 
@@ -190,6 +263,8 @@ has an `AAD` variant that additionally authenticates caller-supplied context.
 | RSA-OAEP (`rsa.go`) | `Encoder.EncryptRSA` / `Decoder.DecryptRSA` (+ `Byte` variants) |
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
 | Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
+| Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader` (+ `AAD` variants) |
+| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile` (+ `AAD` variants), `PaddedSize` |
 
 The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
 `...AAD` forms that bind caller-supplied associated data (authenticated, not
@@ -259,7 +334,19 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
 - **Per-message size limit.** A single message is capped by the underlying
   AEAD: roughly **256 GiB** for ChaCha20/XChaCha20-Poly1305 and **64 GiB** for
   AES-GCM. Anything larger returns an error rather than panicking. These bounds
-  sit far above any realistic payload; stream or chunk data that big.
+  sit far above any realistic payload; for data that big use the `envelope`
+  streaming API, which chunks it and lifts the ceiling.
+- **A stream is only trustworthy once it ends.** The streaming API authenticates
+  every chunk before releasing it, but a consumer that acts on partial output
+  has acted on data whose stream may still fail. Treat the destination as
+  unusable until the call returns without error, and note that
+  `StreamWriter.Close` finalizes whatever was written. Call it only after the
+  whole input went in.
+- **Ciphertext reveals its plaintext length.** Both formats store enough in the
+  clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
+  for a stream. Content, key and context stay hidden, but size alone can
+  identify a known file. Use `SealPaddedFile` for files; `SealInt64` is already
+  fixed-width, and other tokens need padding before you seal them.
 - **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
   private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after
   `NewEncoder` / `NewDecoder`.
