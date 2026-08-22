@@ -16,6 +16,12 @@ stream can carry a padded payload (`version(1) || realLen(8) || payload ||
 zeros`, sealed inside the stream) so the file size stops revealing the exact
 plaintext length.
 
+![Diagram: the key ladder, the three ways to seal (single-shot, streaming, padded stream), and the open path that mirrors them](envelope-flow.png)
+
+The whole scheme on one page: derive the KEK and unwrap the master key, seal
+an item, a stream or a padded stream, then walk the same ladder backwards to
+open it.
+
 [**Wire format**](#wire-format): the complete byte layout of both formats, with worked examples.
 
 Files: [`envelope.go`](#envelopego) · [`keys.go`](#keysgo) · [`cipher.go`](#ciphergo) · [`stream.go`](#streamgo) · [`file.go`](#filego) · [`padding.go`](#paddinggo) · [`hash.go`](#hashgo) · [tests](#test-files)
