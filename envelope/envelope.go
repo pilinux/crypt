@@ -52,6 +52,38 @@
 // data, so not a single header byte can be altered without decryption
 // failing.
 //
+// # Streaming large inputs
+//
+// The Seal/Open functions above hold the whole item in memory. Inputs that do
+// not fit, such as multi-gigabyte files or request bodies, go through the
+// streaming API instead ([Scheme.SealWriter], [Scheme.OpenReader],
+// [Scheme.SealFile], [Scheme.SealStream] and friends), which seals one chunk
+// at a time under the same key model and keeps memory use at one chunk:
+//
+//	header || chunk 0 || chunk 1 || ... || final chunk
+//
+//	where header = version(1) || saltLen(1) || salt || chunkSize(4) || noncePrefix(15)
+//	and   chunk  = XChaCha20-Poly1305(chunkSize bytes of plaintext)
+//
+// Every chunk is sealed under the same per-stream sub-key with the nonce
+// noncePrefix || counter || finalFlag, so chunks cannot be reordered,
+// duplicated, dropped or the stream cut short: the counter pins each chunk to
+// its position and the flag marks the end. The header, and any caller-supplied
+// AAD, is authenticated with every chunk.
+//
+// What a stream costs:
+//
+//	memory: one chunk, whatever the input size. The buffer is allocated once
+//	        per stream and reused, and every chunk is sealed and opened in
+//	        place, so nothing is allocated per chunk.
+//	size:   len(header) + plaintext + TagSize*chunks bytes, where
+//	        chunks = ceil(plaintext/chunkSize), at least one. That is 37 bytes
+//	        plus 16 bytes per chunk: 160 KiB of tags on a 10 GB file at the
+//	        default chunk size, about 0.0015%.
+//
+// Bigger chunks buy less overhead at the price of more memory per stream; the
+// default is a middle ground, [Config.ChunkSize] moves it.
+//
 // # Context binding (AAD)
 //
 // Every Seal/Open function has an AAD variant ([Scheme.SealBytesAAD],
@@ -156,6 +188,13 @@ type Config struct {
 
 	// SubKeyLabel is the HKDF info label for deriving per-item sub-keys.
 	SubKeyLabel string
+
+	// ChunkSize is the plaintext chunk size of the streaming API, in bytes,
+	// within [MinChunkSize]..[MaxChunkSize]. Zero falls back to
+	// [DefaultChunkSize]; an out-of-range value is reported when a stream is
+	// created. Unlike the labels it is not frozen: every stream records its
+	// own chunk size, so changing this never orphans sealed data.
+	ChunkSize int
 }
 
 // Scheme carries the domain-separation labels used by the label-dependent
@@ -164,10 +203,12 @@ type Config struct {
 type Scheme struct {
 	kekLabel    string
 	subKeyLabel string
+	chunkSize   int
 }
 
 // New returns a [Scheme] using the labels in cfg, falling back to
-// [DefaultKEKLabel] / [DefaultSubKeyLabel] for any label left empty.
+// [DefaultKEKLabel] / [DefaultSubKeyLabel] for any label left empty and to
+// [DefaultChunkSize] for an unset chunk size.
 func New(cfg Config) *Scheme {
 	if cfg.KEKLabel == "" {
 		cfg.KEKLabel = DefaultKEKLabel
@@ -175,14 +216,18 @@ func New(cfg Config) *Scheme {
 	if cfg.SubKeyLabel == "" {
 		cfg.SubKeyLabel = DefaultSubKeyLabel
 	}
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = DefaultChunkSize
+	}
 	return &Scheme{
 		kekLabel:    cfg.KEKLabel,
 		subKeyLabel: cfg.SubKeyLabel,
+		chunkSize:   cfg.ChunkSize,
 	}
 }
 
-// Default returns a [Scheme] that uses the package default labels. It is
-// shorthand for New(Config{}).
+// Default returns a [Scheme] that uses the package default labels and chunk
+// size. It is shorthand for New(Config{}).
 func Default() *Scheme {
 	return New(Config{})
 }

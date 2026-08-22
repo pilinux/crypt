@@ -12,7 +12,7 @@ import (
 
 func main() {
 	text := "Hello world"
-	secretPass := ",D'(bHOpO#beU(Fn@~_6Enn3a2n=aEQWg''vz"
+	secretPass := "0123456789abcdef0123456789abcdef01234567"
 
 	// generate a random 256-bit salt
 	salt := make([]byte, 32)

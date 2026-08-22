@@ -9,12 +9,21 @@
 // The header (version, saltLen, salt) is authenticated as AEAD additional
 // data, together with any caller-supplied AAD (see the context-binding
 // section below).
+//
+// The last section switches to the streaming API, which seals a file too big
+// for memory as a chain of chunks:
+//
+//	version(1) || saltLen(1) || salt || chunkSize(4) || noncePrefix(15) || chunk...
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pilinux/crypt/envelope"
@@ -152,8 +161,14 @@ func main() {
 	_, err = scheme.OpenString(masterKey, boundToken)
 	fmt.Printf("  open with no aad fails    = %t (%v)\n", err != nil, err)
 
-	// 9. Fingerprint a payload and mint a random file ID.
-	section("9. Helpers")
+	// 9. Seal a file that does not fit in memory, chunk by chunk.
+	if err := streamDemo(masterKey); err != nil {
+		fmt.Println("stream demo:", err)
+		return
+	}
+
+	// 10. Fingerprint a payload and mint a random file ID.
+	section("10. Helpers")
 	fmt.Println("  sha256:", envelope.Sha256Hex([]byte(plain)))
 	id, err := envelope.RandomHex(16)
 	if err != nil {
@@ -219,4 +234,126 @@ func dumpEnvelope(label, token string) {
 	aead := blob[2+saltLen:]
 	dumpBytes("  salt", salt)
 	dumpAEAD("  ", aead)
+}
+
+// streamDemo shows the chunked streaming API on a file larger than one chunk.
+// The plaintext is never held in memory as a whole: only one chunk at a time
+// is buffered, so the same code handles a 100 GB file.
+func streamDemo(masterKey []byte) error {
+	// Same labels as above (so the same keys), but a small chunk size to keep
+	// the demo file small while still producing several chunks. Production
+	// code can leave ChunkSize unset and get envelope.DefaultChunkSize (1 MiB).
+	const chunkSize = 256 << 10
+	scheme := envelope.New(envelope.Config{
+		KEKLabel:    "myapp:kek:v1",
+		SubKeyLabel: "myapp:data-subkey:v1",
+		ChunkSize:   chunkSize,
+	})
+
+	dir, err := os.MkdirTemp("", "crypt-envelope-stream-")
+	if err != nil {
+		return err
+	}
+	fmt.Println("Temp dir:", dir)
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// 1 MiB plus a remainder, so the stream ends on a short chunk.
+	payload := make([]byte, 1<<20+12345)
+	if _, err := rand.Read(payload); err != nil {
+		return err
+	}
+	plainPath := filepath.Join(dir, "large.bin")
+	if err := os.WriteFile(plainPath, payload, 0o600); err != nil {
+		return err
+	}
+
+	section("9. Stream a large file (chunked, constant memory)")
+	fmt.Printf("  chunk size = %d bytes\n", chunkSize)
+	fmt.Printf("  plaintext  = %s (%d bytes)\n", filepath.Base(plainPath), len(payload))
+	fmt.Printf("  sha256     = %s\n", envelope.Sha256Hex(payload))
+
+	// Seal: the file name doubles as context, so a sealed file cannot be
+	// swapped for another one under the same master key.
+	sealedPath := filepath.Join(dir, "large.bin.enc")
+	aad := []byte("large.bin")
+	// SealFileAAD takes the destination first, like io.Copy; it refuses to
+	// overwrite an existing file, so a mixed-up order cannot destroy the source.
+	n, err := scheme.SealFileAAD(masterKey, sealedPath, plainPath, aad)
+	if err != nil {
+		return err
+	}
+	sealed, err := os.ReadFile(sealedPath)
+	if err != nil {
+		return err
+	}
+	chunks := (len(payload) + chunkSize - 1) / chunkSize
+	fmt.Printf("  sealed     = %s (%d bytes, +%d for %d chunks + header)\n",
+		filepath.Base(sealedPath), len(sealed), len(sealed)-int(n), chunks)
+	dumpStreamHeader(sealed)
+
+	// Open it back and compare fingerprints end to end.
+	openedPath := filepath.Join(dir, "large.out")
+	if _, err := scheme.OpenFileAAD(masterKey, openedPath, sealedPath, aad); err != nil {
+		return err
+	}
+	opened, err := os.ReadFile(openedPath)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  recovered  = %d bytes, sha256 %s\n", len(opened), envelope.Sha256Hex(opened))
+	fmt.Printf("  digests match = %t\n", envelope.Sha256Hex(opened) == envelope.Sha256Hex(payload))
+
+	// A single flipped byte in the middle of the file is caught.
+	tampered := append([]byte{}, sealed...)
+	tampered[len(tampered)/2] ^= 0xFF
+	if err := reportOpen(scheme, masterKey, dir, "tampered chunk", tampered, aad); err != nil {
+		return err
+	}
+
+	// So is a stream cut short: the final chunk is flagged as such in its
+	// nonce, so a truncated file can never look complete.
+	cut := sealed[:len(sealed)-(len(payload)%chunkSize+envelope.TagSize)]
+	if err := reportOpen(scheme, masterKey, dir, "truncated stream", cut, aad); err != nil {
+		return err
+	}
+
+	// The wrong context is rejected as well.
+	return reportOpen(scheme, masterKey, dir, "wrong aad", sealed, []byte("other.bin"))
+}
+
+// reportOpen writes a mangled stream to a scratch file and prints whether
+// opening it fails. Only a broken scratch file is an error worth returning.
+func reportOpen(scheme *envelope.Scheme, masterKey []byte, dir, label string, blob, aad []byte) error {
+	name := strings.ReplaceAll(label, " ", "-")
+	src := filepath.Join(dir, name+".enc")
+	if err := os.WriteFile(src, blob, 0o600); err != nil {
+		return err
+	}
+
+	_, err := scheme.OpenFileAAD(masterKey, filepath.Join(dir, name+".out"), src, aad)
+	fmt.Printf("  %-16s fails = %t (%v)\n", label, err != nil, err)
+	return nil
+}
+
+// dumpStreamHeader prints the cleartext header at the start of a sealed
+// stream: version, salt and the parameters needed to rebuild the chunk keys
+// and nonces.
+func dumpStreamHeader(blob []byte) {
+	prefixLen := envelope.NonceSize - 9 // counter(8) + final flag(1)
+	if len(blob) < 2+envelope.SaltSize+4+prefixLen {
+		fmt.Println("  too short to be a sealed stream")
+		return
+	}
+
+	saltLen := int(blob[1])
+	salt := blob[2 : 2+saltLen]
+	rest := blob[2+saltLen:]
+
+	fmt.Println("  stream header breakdown:")
+	fmt.Printf("    version     = 0x%02x\n", blob[0])
+	fmt.Printf("    saltLen     = %d\n", saltLen)
+	dumpBytes("  salt", salt)
+	fmt.Printf("    chunkSize   = %d\n", binary.BigEndian.Uint32(rest[:4]))
+	dumpBytes("  noncePrefix", rest[4:4+prefixLen])
+	fmt.Printf("    chunk nonce = noncePrefix || counter(8) || final flag(1)\n")
 }
