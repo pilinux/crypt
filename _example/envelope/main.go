@@ -14,6 +14,11 @@
 // for memory as a chain of chunks:
 //
 //	version(1) || saltLen(1) || salt || chunkSize(4) || noncePrefix(15) || chunk...
+//
+// A sealed stream still reveals the exact plaintext length, so the section
+// after that pads the payload before sealing:
+//
+//	version(1) || realLen(8) || payload || zero padding   (all inside the stream)
 package main
 
 import (
@@ -26,6 +31,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pilinux/crypt"
 	"github.com/pilinux/crypt/envelope"
 )
 
@@ -74,6 +80,9 @@ func main() {
 		return
 	}
 	dumpBytes("wrapped master key (persist this)", wrapped)
+	// The blob is raw bytes; base64 is the form that goes into a config file,
+	// an env var or a database column.
+	fmt.Printf("  %-34s %s\n", "wrapped master key (base64):", (&crypt.Encoder{}).ToBase64Std(wrapped))
 	// WrapKey uses XChaCha20-Poly1305 with the nonce prepended, so the wrapped
 	// blob is nonce || ciphertext || tag (no envelope header).
 	dumpAEAD("wrapped", wrapped)
@@ -167,8 +176,14 @@ func main() {
 		return
 	}
 
-	// 10. Fingerprint a payload and mint a random file ID.
-	section("10. Helpers")
+	// 10. Hide the plaintext length by padding before sealing.
+	if err := paddingDemo(masterKey); err != nil {
+		fmt.Println("padding demo:", err)
+		return
+	}
+
+	// 11. Fingerprint a payload and mint a random file ID.
+	section("11. Helpers")
 	fmt.Println("  sha256:", envelope.Sha256Hex([]byte(plain)))
 	id, err := envelope.RandomHex(16)
 	if err != nil {
@@ -333,6 +348,104 @@ func reportOpen(scheme *envelope.Scheme, masterKey []byte, dir, label string, bl
 	_, err := scheme.OpenFileAAD(masterKey, filepath.Join(dir, name+".out"), src, aad)
 	fmt.Printf("  %-16s fails = %t (%v)\n", label, err != nil, err)
 	return nil
+}
+
+// paddingDemo shows how padding hides the plaintext length. A sealed stream
+// otherwise states its chunk size in the clear, so the exact payload size
+// follows from the file size; SealPaddedFile rounds the payload up to a Padme
+// bucket first, so every length inside one bucket lands on the same size on
+// disk.
+func paddingDemo(masterKey []byte) error {
+	scheme := envelope.New(envelope.Config{
+		KEKLabel:    "myapp:kek:v1",
+		SubKeyLabel: "myapp:data-subkey:v1",
+	})
+
+	dir, err := os.MkdirTemp("", "crypt-envelope-padding-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	section("10. Pad before sealing to hide the plaintext length")
+
+	// Three payloads of different sizes that share one Padme bucket, plus one
+	// from the next bucket up.
+	sizes := []int{94500, 96037, 96200, 100000}
+	fmt.Printf("  %10s %10s %12s %12s %8s\n", "payload", "padded", "sealed+pad", "sealed raw", "overhead")
+	for i, n := range sizes {
+		payload := make([]byte, n)
+		if _, err := rand.Read(payload); err != nil {
+			return err
+		}
+		src := filepath.Join(dir, fmt.Sprintf("f%d.bin", i))
+		if err := os.WriteFile(src, payload, 0o600); err != nil {
+			return err
+		}
+
+		// The file name doubles as context, as in the stream demo above.
+		aad := []byte(filepath.Base(src))
+		padded := filepath.Join(dir, fmt.Sprintf("f%d.pad.enc", i))
+		if _, err := scheme.SealPaddedFileAAD(masterKey, padded, src, aad); err != nil {
+			return err
+		}
+		plain := filepath.Join(dir, fmt.Sprintf("f%d.enc", i))
+		if _, err := scheme.SealFileAAD(masterKey, plain, src, aad); err != nil {
+			return err
+		}
+
+		padSize, err := fileSize(padded)
+		if err != nil {
+			return err
+		}
+		rawSize, err := fileSize(plain)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  %10d %10d %12d %12d %7.1f%%\n",
+			n, envelope.PaddedSize(int64(n)), padSize, rawSize,
+			100*float64(padSize-int64(n))/float64(n))
+
+		// Round-trip the padded file: the padding is authenticated, then
+		// dropped, so what comes back is the original payload.
+		opened := filepath.Join(dir, fmt.Sprintf("f%d.out", i))
+		got, err := scheme.OpenPaddedFileAAD(masterKey, opened, padded, aad)
+		if err != nil {
+			return err
+		}
+		back, err := os.ReadFile(opened)
+		if err != nil {
+			return err
+		}
+		if got != int64(n) || envelope.Sha256Hex(back) != envelope.Sha256Hex(payload) {
+			return fmt.Errorf("padded round-trip failed for %d bytes", n)
+		}
+	}
+	fmt.Println("  the first three payloads differ in size but seal to the same number of bytes,")
+	fmt.Println("  so the file size no longer identifies which one is on disk")
+
+	// A stream sealed without padding is not a padded payload, and says so
+	// instead of handing back the frame as if it were data.
+	src := filepath.Join(dir, "unpadded.bin")
+	if err := os.WriteFile(src, []byte("no frame here"), 0o600); err != nil {
+		return err
+	}
+	sealed := filepath.Join(dir, "unpadded.enc")
+	if _, err := scheme.SealFile(masterKey, sealed, src); err != nil {
+		return err
+	}
+	_, err = scheme.OpenPaddedFile(masterKey, filepath.Join(dir, "unpadded.out"), sealed)
+	fmt.Printf("  open an unpadded stream as padded fails = %t (%v)\n", err != nil, err)
+	return nil
+}
+
+// fileSize returns the size of path in bytes.
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 // dumpStreamHeader prints the cleartext header at the start of a sealed

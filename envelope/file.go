@@ -23,7 +23,7 @@ func (s *Scheme) SealFile(masterKey []byte, dstPath, srcPath string) (int64, err
 // dstPath must not exist yet: refusing to overwrite is what keeps a mixed-up
 // argument order from destroying the source file.
 func (s *Scheme) SealFileAAD(masterKey []byte, dstPath, srcPath string, aad []byte) (int64, error) {
-	return pipeFile(dstPath, srcPath, func(dst io.Writer, src io.Reader) (int64, error) {
+	return pipeFile(dstPath, srcPath, func(dst io.Writer, src *os.File) (int64, error) {
 		return s.SealStreamAAD(masterKey, dst, src, aad)
 	})
 }
@@ -42,15 +42,17 @@ func (s *Scheme) OpenFile(masterKey []byte, dstPath, srcPath string) (int64, err
 // only detected part-way through; the incomplete output is removed before the
 // error is returned.
 func (s *Scheme) OpenFileAAD(masterKey []byte, dstPath, srcPath string, aad []byte) (int64, error) {
-	return pipeFile(dstPath, srcPath, func(dst io.Writer, src io.Reader) (int64, error) {
+	return pipeFile(dstPath, srcPath, func(dst io.Writer, src *os.File) (int64, error) {
 		return s.OpenStreamAAD(masterKey, dst, src, aad)
 	})
 }
 
 // pipeFile streams srcPath through fn into a freshly created dstPath, syncs
 // it to disk and removes it again if anything went wrong, so a failed run
-// never leaves a half-written file behind.
-func pipeFile(dstPath, srcPath string, fn func(dst io.Writer, src io.Reader) (int64, error)) (int64, error) {
+// never leaves a half-written file behind. fn receives the open source file
+// rather than a plain io.Reader, so a caller that needs the payload size can
+// Stat the handle it is about to read.
+func pipeFile(dstPath, srcPath string, fn func(dst io.Writer, src *os.File) (int64, error)) (int64, error) {
 	// both paths are chosen by the caller; gosec's file-inclusion warning does not apply.
 	src, err := os.Open(srcPath) // #nosec G304
 	if err != nil {
