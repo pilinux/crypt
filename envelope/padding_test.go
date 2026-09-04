@@ -326,7 +326,7 @@ func TestSealPaddedStreamRejectsSizeMismatch(t *testing.T) {
 
 	var out bytes.Buffer
 	// claim a larger payload than the reader will deliver
-	_, err := s.sealPaddedStream(masterKey, &out, bytes.NewReader(payload), int64(len(payload))+1024, nil)
+	_, err := s.SealPaddedStreamAAD(masterKey, &out, bytes.NewReader(payload), int64(len(payload))+1024, nil)
 	if !errors.Is(err, ErrSourceSize) {
 		t.Errorf("short source: err = %v, want ErrSourceSize", err)
 	}
@@ -357,5 +357,156 @@ func TestPaddedRoundTripThroughZeroPayload(t *testing.T) {
 	}
 	if len(opened) != 0 {
 		t.Errorf("recovered %d bytes, want an empty file", len(opened))
+	}
+}
+
+// TestSealOpenPaddedStream round-trips the padded form entirely in memory,
+// which is the point of the stream variant: a payload that is not already a
+// file never has to be staged on disk to be padded.
+func TestSealOpenPaddedStream(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	for _, tt := range streamSizes {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := randomData(t, tt.n)
+
+			var sealed bytes.Buffer
+			n, err := s.SealPaddedStream(masterKey, &sealed, bytes.NewReader(payload), int64(tt.n))
+			if err != nil {
+				t.Fatalf("SealPaddedStream error: %v", err)
+			}
+			if n != int64(tt.n) {
+				t.Errorf("sealed = %d, want %d payload bytes", n, tt.n)
+			}
+			if want := sealedSize(int(PaddedSize(int64(tt.n)))); sealed.Len() != want {
+				t.Errorf("sealed size = %d, want %d", sealed.Len(), want)
+			}
+
+			var opened bytes.Buffer
+			got, err := s.OpenPaddedStream(masterKey, &opened, &sealed)
+			if err != nil {
+				t.Fatalf("OpenPaddedStream error: %v", err)
+			}
+			if got != int64(tt.n) {
+				t.Errorf("opened = %d, want %d", got, tt.n)
+			}
+			if !bytes.Equal(opened.Bytes(), payload) {
+				t.Error("round-tripped payload differs")
+			}
+		})
+	}
+}
+
+// TestPaddedStreamAAD checks that context binding reaches every chunk of a
+// padded stream, padding chunks included.
+func TestPaddedStreamAAD(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+	aad := []byte("user:42:upload")
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStreamAAD(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload)), aad); err != nil {
+		t.Fatalf("SealPaddedStreamAAD error: %v", err)
+	}
+	blob := sealed.Bytes()
+
+	var opened bytes.Buffer
+	if _, err := s.OpenPaddedStreamAAD(masterKey, &opened, bytes.NewReader(blob), aad); err != nil {
+		t.Fatalf("OpenPaddedStreamAAD error: %v", err)
+	}
+	if !bytes.Equal(opened.Bytes(), payload) {
+		t.Error("round-tripped payload differs")
+	}
+
+	opened.Reset()
+	if _, err := s.OpenPaddedStreamAAD(masterKey, &opened, bytes.NewReader(blob), []byte("user:7:upload")); err == nil {
+		t.Error("wrong aad opened the padded stream")
+	}
+}
+
+// TestPaddedStreamAndFileInterop pins the two entry points to one format: a
+// stream sealed in memory opens as a file and vice versa, so exporting the
+// stream form did not fork the padded layout.
+func TestPaddedStreamAndFileInterop(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+	aad := []byte("interop")
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStreamAAD(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload)), aad); err != nil {
+		t.Fatalf("SealPaddedStreamAAD error: %v", err)
+	}
+
+	// stream -> file
+	sealedPath := writeTempFile(t, "stream.enc", sealed.Bytes())
+	dir := filepath.Dir(sealedPath)
+	openedPath := filepath.Join(dir, "stream.out")
+	if _, err := s.OpenPaddedFileAAD(masterKey, openedPath, sealedPath, aad); err != nil {
+		t.Fatalf("OpenPaddedFileAAD error: %v", err)
+	}
+	back, err := os.ReadFile(openedPath) // #nosec G304
+	if err != nil {
+		t.Fatalf("ReadFile error: %v", err)
+	}
+	if !bytes.Equal(back, payload) {
+		t.Error("stream-sealed payload differs after opening as a file")
+	}
+
+	// file -> stream
+	srcPath := writeTempFile(t, "file.bin", payload)
+	filePath := filepath.Join(filepath.Dir(srcPath), "file.enc")
+	if _, err := s.SealPaddedFileAAD(masterKey, filePath, srcPath, aad); err != nil {
+		t.Fatalf("SealPaddedFileAAD error: %v", err)
+	}
+	fromFile, err := os.ReadFile(filePath) // #nosec G304
+	if err != nil {
+		t.Fatalf("ReadFile error: %v", err)
+	}
+	if len(fromFile) != sealed.Len() {
+		t.Errorf("file-sealed size = %d, stream-sealed = %d", len(fromFile), sealed.Len())
+	}
+
+	var opened bytes.Buffer
+	if _, err := s.OpenPaddedStreamAAD(masterKey, &opened, bytes.NewReader(fromFile), aad); err != nil {
+		t.Fatalf("OpenPaddedStreamAAD error: %v", err)
+	}
+	if !bytes.Equal(opened.Bytes(), payload) {
+		t.Error("file-sealed payload differs after opening as a stream")
+	}
+}
+
+// TestSealPaddedStreamRejectsLongSource is the mirror of the size-mismatch
+// case above: a src that outruns its declared size must not produce a frame
+// that understates the payload.
+func TestSealPaddedStreamRejectsLongSource(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, 4096)
+
+	var out bytes.Buffer
+	_, err := s.SealPaddedStream(masterKey, &out, bytes.NewReader(payload), int64(len(payload))-1024)
+	if !errors.Is(err, ErrSourceSize) {
+		t.Errorf("long source: err = %v, want ErrSourceSize", err)
+	}
+}
+
+// TestOpenPaddedStreamRejectsUnpadded checks that an ordinary stream is
+// reported as unpadded instead of having its first bytes read as a frame.
+func TestOpenPaddedStreamRejectsUnpadded(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	var sealed bytes.Buffer
+	if _, err := s.SealStream(masterKey, &sealed, bytes.NewReader(randomData(t, 512))); err != nil {
+		t.Fatalf("SealStream error: %v", err)
+	}
+
+	var opened bytes.Buffer
+	_, err := s.OpenPaddedStream(masterKey, &opened, &sealed)
+	if !errors.Is(err, ErrNotPadded) {
+		t.Errorf("err = %v, want ErrNotPadded", err)
 	}
 }

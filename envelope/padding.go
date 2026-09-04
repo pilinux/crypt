@@ -58,19 +58,22 @@ const (
 // Errors returned by the padded helpers.
 var (
 	// ErrNotPadded is returned when a stream authenticates but its plaintext
-	// is not the frame written by [Scheme.SealPaddedFile], for example a
-	// stream sealed by [Scheme.SealFile].
+	// is not the frame written by the padded sealers, for example a stream
+	// sealed by [Scheme.SealStream] or [Scheme.SealFile].
 	ErrNotPadded = errors.New("envelope: sealed stream carries no padded payload")
 
-	// ErrSourceSize is returned when the source is not a regular file, or when
-	// its size changed while it was being sealed. Padding is computed from the
-	// size up front, so a source that moves underneath the sealer cannot
-	// produce a well-formed padded stream.
+	// ErrSourceSize is returned when the source does not deliver the number of
+	// bytes the padding was computed for: a [Scheme.SealPaddedFile] source that
+	// is not a regular file or changed size while it was being sealed, or a
+	// [Scheme.SealPaddedStream] src that did not deliver exactly the declared
+	// size. Padding is computed from the size up front, so a source that moves
+	// underneath the sealer cannot produce a well-formed padded stream.
 	ErrSourceSize = errors.New("envelope: source must be a regular file of stable size")
 )
 
-// PaddedSize reports the padded plaintext length [Scheme.SealPaddedFile] uses
-// for a payload of n bytes: the 9-byte frame plus n, rounded up by the Padmé
+// PaddedSize reports the padded plaintext length [Scheme.SealPaddedStream]
+// and [Scheme.SealPaddedFile] use for a payload of n bytes:
+// the 9-byte frame plus n, rounded up by the Padmé
 // rule (Nikitin et al., "Reducing Metadata Leakage from Encrypted Files",
 // PoPETs 2019). Padmé keeps only the top log2(log2(L)) bits of the length
 // significant, which caps the overhead near 12% and leaves it around 3% on
@@ -151,7 +154,7 @@ func (s *Scheme) SealPaddedFileAAD(masterKey []byte, dstPath, srcPath string, aa
 			// a pipe or device has no meaningful size to pad against.
 			return 0, ErrSourceSize
 		}
-		return s.sealPaddedStream(masterKey, dst, src, info.Size(), aad)
+		return s.SealPaddedStreamAAD(masterKey, dst, src, info.Size(), aad)
 	})
 }
 
@@ -170,13 +173,34 @@ func (s *Scheme) OpenPaddedFile(masterKey []byte, dstPath, srcPath string) (int6
 // [ErrNotPadded].
 func (s *Scheme) OpenPaddedFileAAD(masterKey []byte, dstPath, srcPath string, aad []byte) (int64, error) {
 	return pipeFile(dstPath, srcPath, func(dst io.Writer, src *os.File) (int64, error) {
-		return s.openPaddedStream(masterKey, dst, src, aad)
+		return s.OpenPaddedStreamAAD(masterKey, dst, src, aad)
 	})
 }
 
-// sealPaddedStream frames size bytes read from src, appends zero padding out
-// to [PaddedSize] and seals the result as one stream.
-func (s *Scheme) sealPaddedStream(masterKey []byte, dst io.Writer, src io.Reader, size int64, aad []byte) (int64, error) {
+// SealPaddedStream seals size bytes read from src to dst with the payload
+// padded to [PaddedSize]. It is shorthand for [Scheme.SealPaddedStreamAAD]
+// with a nil AAD.
+func (s *Scheme) SealPaddedStream(masterKey []byte, dst io.Writer, src io.Reader, size int64) (int64, error) {
+	return s.SealPaddedStreamAAD(masterKey, dst, src, size, nil)
+}
+
+// SealPaddedStreamAAD frames size bytes read from src, appends zero padding
+// out to [PaddedSize] and seals the result to dst as one stream, binding aad
+// into every chunk. It returns the number of real payload bytes sealed, not
+// the padded length.
+//
+// This is the reader/writer form of [Scheme.SealPaddedFileAAD], and the one to
+// reach for when the payload is not already a file: the padding is generated
+// as the sealer asks for it and only one chunk is ever buffered, so an
+// in-memory blob, an HTTP body or a pipe is padded and sealed on the fly
+// instead of being staged on disk first.
+//
+// size must be the exact number of bytes src will deliver. The Padmé bucket is
+// computed from it before the first chunk is sealed, which is why the length
+// cannot simply be discovered at the end; a src that delivers a different
+// number of bytes fails with [ErrSourceSize] rather than producing a frame
+// that lies about its payload.
+func (s *Scheme) SealPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Reader, size int64, aad []byte) (int64, error) {
 	target := PaddedSize(size)
 	if target == 0 {
 		return 0, ErrSourceSize
@@ -199,16 +223,29 @@ func (s *Scheme) sealPaddedStream(masterKey []byte, dst io.Writer, src io.Reader
 		return n, err
 	}
 	if n != target {
-		// src delivered more or fewer bytes than Stat promised, so the frame
-		// no longer describes the payload. pipeFile removes the destination.
+		// src delivered more or fewer bytes than the declared size, so the
+		// frame no longer describes the payload. The file wrappers remove the
+		// destination; a stream caller must discard dst itself.
 		return n, ErrSourceSize
 	}
 	return size, nil
 }
 
-// openPaddedStream reads the frame, copies the payload and then drains the
-// padding.
-func (s *Scheme) openPaddedStream(masterKey []byte, dst io.Writer, src io.Reader, aad []byte) (int64, error) {
+// OpenPaddedStream opens a padded stream from src into dst, discarding the
+// padding. It is shorthand for [Scheme.OpenPaddedStreamAAD] with a nil AAD.
+func (s *Scheme) OpenPaddedStream(masterKey []byte, dst io.Writer, src io.Reader) (int64, error) {
+	return s.OpenPaddedStreamAAD(masterKey, dst, src, nil)
+}
+
+// OpenPaddedStreamAAD opens a stream sealed by [Scheme.SealPaddedStreamAAD]
+// into dst, verifying aad, and returns the number of payload bytes written. It
+// reads the frame, copies out exactly that many bytes and then drains the
+// padding; the drain is what authenticates the padding-only trailing chunks
+// and the final-chunk flag, so a stream truncated inside its padding fails.
+//
+// A stream that authenticates but was not sealed with padding fails with
+// [ErrNotPadded].
+func (s *Scheme) OpenPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Reader, aad []byte) (int64, error) {
 	r, err := s.OpenReaderAAD(masterKey, src, aad)
 	if err != nil {
 		return 0, err

@@ -30,7 +30,8 @@ it lives in, then the one naming pattern the ciphers share.
   protecting many records under a single rotatable secret.
 - **Streaming**: chunked XChaCha20-Poly1305 for files that do not fit in
   memory, with constant memory use and no size ceiling.
-- **Length hiding**: pad a file before sealing so its size stops identifying it.
+- **Length hiding**: pad a payload before sealing so its size stops
+  identifying it.
 
 ## Install
 
@@ -229,13 +230,25 @@ untrusted header.
 ### Hiding the file length
 
 A sealed stream states its chunk size in the clear, so the exact plaintext
-length follows from the file size. `SealPaddedFile` pads the payload first,
+length follows from the file size. The padded pair pads the payload first,
 inside the encryption:
 
 ```go
+// Files: the payload size comes from a Stat.
 n, err := scheme.SealPaddedFileAAD(masterKey, "doc.enc", "doc.pdf", []byte("doc"))
 _, err = scheme.OpenPaddedFileAAD(masterKey, "doc.out", "doc.enc", []byte("doc"))
+
+// Anything else: an io.Reader plus its length. Nothing is staged on disk.
+_, err = scheme.SealPaddedStream(masterKey, w, r, size) // io.Writer <- io.Reader
+_, err = scheme.OpenPaddedStream(masterKey, w, r)
 ```
+
+Both produce the same format, so a padded blob sealed one way opens the other.
+Padding costs no memory: the frame, the payload and the zero padding are pulled
+through the chunk sealer as it asks for them, so a padded 10 GB upload is
+sealed on the fly exactly like an unpadded one. The length is the one thing
+needed in advance, since it is written ahead of the payload and fixes the
+bucket: pass a `Content-Length`, a `len()`, or use the file form.
 
 The payload is framed as `version(1) || realLen(8) || payload || zero padding`
 and rounded up to a Padmé bucket (`PaddedSize`), destroying 12 to 25 bits of
@@ -256,7 +269,7 @@ independently; use `RandomHex` names if that matters.
 | Let someone encrypt *to you* using your public key | **RSA-OAEP** | PEM key pair |
 | Protect many records under one rotatable secret | **`envelope`** subpackage | derived |
 | Encrypt a file too big to hold in memory | **`envelope`** streaming (`SealFile`, `SealWriter`) | derived |
-| Stop a file's size from identifying it | **`envelope`** padding (`SealPaddedFile`) | derived |
+| Stop a file's size from identifying it | **`envelope`** padding (`SealPaddedFile`, `SealPaddedStream`) | derived |
 
 ## API at a glance
 
@@ -269,7 +282,7 @@ independently; use `RandomHex` names if that matters.
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
 | Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
 | Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader` (+ `AAD` variants) |
-| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile` (+ `AAD` variants), `PaddedSize` |
+| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream` (+ `AAD` variants), `PaddedSize` |
 
 The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
 `...AAD` forms that bind caller-supplied associated data (authenticated, not
@@ -350,8 +363,9 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
 - **Ciphertext reveals its plaintext length.** Both formats store enough in the
   clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
   for a stream. Content, key and context stay hidden, but size alone can
-  identify a known file. Use `SealPaddedFile` for files; `SealInt64` is already
-  fixed-width, and other tokens need padding before you seal them.
+  identify a known file. Use `SealPaddedFile` for files and
+  `SealPaddedStream` for everything else; `SealInt64` is already fixed-width,
+  and other tokens need padding before you seal them.
 - **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
   private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after
   `NewEncoder` / `NewDecoder`.

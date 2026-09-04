@@ -316,7 +316,7 @@ partial destination for you.
 
 ### 4. Padded payloads (length hiding)
 
-Both formats above reveal the exact plaintext length. `SealPaddedFile` closes
+Both formats above reveal the exact plaintext length. The padded pair closes
 that gap by framing and padding the payload *before* it reaches the stream
 sealer, so the padding is encrypted and authenticated like any other plaintext:
 
@@ -345,6 +345,30 @@ header, so interior chunks carry no length information and padding them would
 hide nothing. Whether the padding fills out the final chunk or adds whole
 chunks after it is just arithmetic on the bucket size.
 
+#### Two ways in, one format
+
+| Entry point | Source | Where the size comes from |
+| --- | --- | --- |
+| `SealPaddedStream[AAD](masterKey, dst, src, size, aad)` | any `io.Reader` | the `size` argument |
+| `SealPaddedFile[AAD](masterKey, dstPath, srcPath, aad)` | a path | `Stat` on the open handle |
+
+The file form is a `pipeFile` wrapper around the stream form, so both write the
+identical blob and either one opens what the other sealed.
+
+**Padding costs no memory and no scratch space.** The frame, the payload and
+the zero padding are stitched together with `io.MultiReader` and pulled through
+the ordinary chunk sealer as it asks for them: one chunk is buffered, the zeros
+are generated on demand by `zeroReader`, and the plaintext is never staged
+anywhere. A padded 10 GB upload seals exactly like an unpadded one.
+
+**The length is the one thing needed in advance.** `realLen` sits at the head
+of the plaintext, so it must be known before chunk 0 is sealed, and the Padmé
+bucket must be known before the padding is generated. A `Content-Length`, a
+`len()`, or the file form's `Stat` all supply it. A `src` that then delivers a
+different number of bytes fails with `ErrSourceSize` rather than producing a
+frame that lies about its payload; `SealPaddedFile` removes the partial
+destination for you, a stream caller must discard `dst` itself.
+
 #### Bucket policy
 
 `PaddedSize(n)` returns `padme(9 + n)`, the Padmé rule from
@@ -372,8 +396,9 @@ one. For that, pad every file in a class to one fixed size and pay for it.
 
 #### Reading it back
 
-`OpenPaddedFile` reads the frame, writes out exactly `realLen` bytes, and then
-**drains the rest of the stream**. That last step is not optional: the padding
+`OpenPaddedStream` (and `OpenPaddedFile`, which wraps it) reads the frame,
+writes out exactly `realLen` bytes, and then **drains the rest of the
+stream**. That last step is not optional: the padding
 occupies whole trailing chunks, and only reading to the end authenticates them
 and the final-chunk flag. Stopping at the payload would silently accept a
 stream truncated inside its padding.
@@ -381,7 +406,7 @@ stream truncated inside its padding.
 | Situation | Error |
 | --- | --- |
 | stream sealed without padding, or a frame that does not fit its stream | `ErrNotPadded` |
-| source is not a regular file, or changed size while being sealed | `ErrSourceSize` |
+| source is not a regular file, changed size while being sealed, or did not deliver the declared `size` | `ErrSourceSize` |
 | padding chunks removed, reordered or altered | `ErrStreamAuth`, thanks to the drain |
 
 Padding hides the length and nothing else. The file name, the directory, the
@@ -415,10 +440,10 @@ opaque names (`RandomHex`) and keep the mapping in a sealed column.
 | the salt, nonce and nonce prefix, none of which are secret | whether two blobs hold the same plaintext: fresh salt and nonce per item make that unlinkable |
 | the number of chunks a stream was cut into | which master key sealed it: nothing in the blob identifies the key |
 
-If plaintext length matters for your data, seal files with
-[`SealPaddedFile`](#4-padded-payloads-length-hiding). Single-shot tokens are
-not padded (`SealInt64` is the one fixed-width case), so pad those yourself
-before sealing.
+If plaintext length matters for your data, seal it with
+[`SealPaddedFile` or `SealPaddedStream`](#4-padded-payloads-length-hiding).
+Single-shot tokens are not padded (`SealInt64` is the one fixed-width case), so
+pad those yourself before sealing.
 
 ---
 
@@ -575,9 +600,10 @@ numbers.
   sealed ahead of the payload, `version(1) || realLen(8 BE)`.
 - `ErrNotPadded`: the stream authenticates but its plaintext is not a padded
   frame, for example a stream sealed by `SealFile`.
-- `ErrSourceSize`: source is not a regular file, or changed size while being
-  sealed. Padding is computed from the size up front, so a moving source cannot
-  produce a well-formed padded stream.
+- `ErrSourceSize`: source is not a regular file, changed size while being
+  sealed, or did not deliver the `size` a stream caller declared. Padding is
+  computed from the size up front, so a source that moves underneath the sealer
+  cannot produce a well-formed padded stream.
 - `PaddedSize(n)`: the padded plaintext length for an n-byte payload, `padme(9 + n)`.
   Exported so callers can budget storage; returns 0 for a negative or
   unrepresentable n.
@@ -586,20 +612,25 @@ numbers.
   leaves the length unpadded rather than wrapping.
 - `zeroReader`: an endless run of zeros. The padding is XORed with the
   keystream like real data, so zeros are indistinguishable once sealed.
+- `(*Scheme) SealPaddedStream(masterKey, dst, src, size)` → `SealPaddedStreamAAD(..., nil)`.
+- `(*Scheme) SealPaddedStreamAAD(masterKey, dst, src, size, aad)`: the padded
+  primitive. `io.MultiReader(frame, src, zeros)` → `SealStreamAAD`, then check
+  the sealed total against `PaddedSize` so a source that declared or changed
+  its size fails (`ErrSourceSize`) instead of writing a frame that lies about
+  the payload. Returns the real payload length, not the padded one. Nothing
+  beyond one chunk is buffered, so an in-memory blob, an HTTP body or a pipe is
+  padded and sealed on the fly.
+- `(*Scheme) OpenPaddedStream(masterKey, dst, src)` → `OpenPaddedStreamAAD(..., nil)`.
+- `(*Scheme) OpenPaddedStreamAAD(masterKey, dst, src, aad)`: `OpenReaderAAD` →
+  read the frame → `io.CopyN` the payload → **drain the rest**. The drain
+  authenticates the padding-only trailing chunks and the final-chunk flag;
+  without it a stream truncated inside its padding would pass.
 - `(*Scheme) SealPaddedFile(masterKey, dstPath, srcPath)` → `SealPaddedFileAAD(..., nil)`.
 - `(*Scheme) SealPaddedFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` →
-  `Stat` the open handle → `sealPaddedStream`. Returns the real payload length,
-  not the padded one.
+  `Stat` the open handle → `SealPaddedStreamAAD`.
 - `(*Scheme) OpenPaddedFile(masterKey, dstPath, srcPath)` → `OpenPaddedFileAAD(..., nil)`.
 - `(*Scheme) OpenPaddedFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` plus
-  `openPaddedStream`.
-- `sealPaddedStream(...)`: `io.MultiReader(frame, src, zeros)` → `SealStreamAAD`,
-  then check the sealed total against `PaddedSize` so a source that changed
-  size is caught rather than sealed with a lying frame.
-- `openPaddedStream(...)`: `OpenReaderAAD` → read the frame → `io.CopyN` the
-  payload → **drain the rest**. The drain is what authenticates the
-  padding-only trailing chunks and the final-chunk flag; without it a stream
-  truncated inside its padding would pass.
+  `OpenPaddedStreamAAD`.
 
 ## hash.go
 
@@ -617,5 +648,5 @@ Small helpers, unrelated to key derivation.
 - `cipher_test.go`: salt generation, sub-key derivation, Seal/Open round-trips and tamper cases for bytes, string and int64, AAD mismatch.
 - `stream_test.go`: round-trips and sizes (`sealedSize`), AAD, wrong key, integrity (reorder, duplicate, drop, truncate, bit flip), envelope/stream separation, chunk-size handling, sticky errors both ways, header codec, nonce layout, and `TestStreamAllocationsPerChunk` (1-chunk versus 100-chunk allocations, guarding the no-per-chunk-allocation property).
 - `file_test.go`: file round-trip with and without AAD, refusal to overwrite an existing destination, missing source, partial output removed on corruption.
-- `padding_test.go`: `PaddedSize` values, monotonicity and the 12% overhead cap, padded round-trips across the chunk boundary cases, AAD, the length-hiding property (three payload sizes, one file size), padding-only truncation caught by the drain, unpadded and malformed frames rejected, irregular source, size mismatch.
+- `padding_test.go`: `PaddedSize` values, monotonicity and the 12% overhead cap, padded round-trips across the chunk boundary cases (file and in-memory stream), AAD, the length-hiding property (three payload sizes, one file size), stream/file format interop, padding-only truncation caught by the drain, unpadded and malformed frames rejected, irregular source, size mismatch in both directions.
 - `hash_test.go`: `Sha256Hex` against known digests, `RandomHex` length and uniqueness.
