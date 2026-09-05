@@ -248,7 +248,10 @@ Padding costs no memory: the frame, the payload and the zero padding are pulled
 through the chunk sealer as it asks for them, so a padded 10 GB upload is
 sealed on the fly exactly like an unpadded one. The length is the one thing
 needed in advance, since it is written ahead of the payload and fixes the
-bucket: pass a `Content-Length`, a `len()`, or use the file form.
+bucket: pass a `Content-Length`, a `len()`, or use the file form. A source that
+then delivers a different number of bytes fails with `ErrSourceSize` at the
+payload boundary, before a single byte of padding is written, which is what
+makes `size` safe to accept from an untrusted peer.
 
 The payload is framed as `version(1) || realLen(8) || payload || zero padding`
 and rounded up to a Padmé bucket (`PaddedSize`), destroying 12 to 25 bits of
@@ -256,6 +259,28 @@ the length for about 1.4% extra storage. Measured over 162,524 real files: of
 those above 1 MB, 61% are uniquely identified by their exact size, 3.9% after
 padding. `OpenPaddedFile` reads the padding back and authenticates it before
 discarding it, so truncation inside the padding still fails.
+
+**When the length is not knowable up front**, as with an HTML multipart upload
+(no per-part `Content-Length`, and the file is chosen after the page loads),
+seal it unpadded and pad it afterwards:
+
+```go
+// Request path: SealStream takes no size at all.
+n, err := scheme.SealStreamAAD(masterKey, dst, part, aad)
+
+// Background pass: open the unpadded object and re-seal it padded.
+// n comes from stage 1 here, or from the sealed size (see below).
+r, err := scheme.OpenReaderAAD(masterKey, src, aad)
+_, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
+```
+
+Nothing has to carry `n` between the two stages: an unpadded stream is
+`37 + n + 16*ceil(n/ChunkSize)` bytes, so the sealed size gives the length
+back. A crash then leaves a valid sealed object rather than a lost upload.
+Which objects still owe a pass is the one thing this does not tell you for
+free: padded and plain blobs are deliberately indistinguishable, so an unpadded
+object opened as padded fails with `ErrStreamAuth`, exactly like a wrong key.
+Retry with `OpenStream` to identify it, or track the state alongside the object.
 
 Only the length is hidden. File names, timestamps and access patterns leak
 independently; use `RandomHex` names if that matters.
@@ -301,7 +326,13 @@ with `go run ./_example/<name>`:
 - [XChaCha20-Poly1305 AEAD](_example/xchacha20poly1305/main.go)
 - [RSA](_example/rsa/main.go)
 - [Hashing](_example/hashing/main.go)
-- [Envelope encryption at rest](_example/envelope/main.go)
+- [Envelope encryption at rest](_example/envelope/main.go). Add `-serve
+  127.0.0.1:8080` to skip the demos and start a small upload server
+  ([server.go](_example/envelope/server.go)) instead, which pushes a real file
+  of your choosing through the streaming and padding APIs. It caps uploads at
+  1 GiB and keeps ciphertext in a temp dir; `-max 0 -dir /path` lifts both,
+  which is what a multi-gigabyte test needs. Verified at 5 GB, with the server
+  sitting at 8.9 MiB resident.
 
 ## Generate RSA keys
 
@@ -364,8 +395,9 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
   for a stream. Content, key and context stay hidden, but size alone can
   identify a known file. Use `SealPaddedFile` for files and
-  `SealPaddedStream` for everything else; `SealInt64` is already fixed-width,
-  and other tokens need padding before you seal them.
+  `SealPaddedStream` for everything else, or seal unpadded and pad in a second
+  pass when the length is not known up front; `SealInt64` is already
+  fixed-width, and other tokens need padding before you seal them.
 - **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
   private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after
   `NewEncoder` / `NewDecoder`.

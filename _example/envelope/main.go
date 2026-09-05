@@ -19,6 +19,22 @@
 // after that pads the payload before sealing:
 //
 //	version(1) || realLen(8) || payload || zero padding   (all inside the stream)
+//
+// Padding needs that length before the first chunk is sealed, which an HTML
+// multipart upload cannot supply. The last section shows the way around it:
+// seal the upload unpadded, since that needs no length at all, and pad it in a
+// background pass once the length is known.
+//
+// Run with -serve to skip the demos and start the upload server in server.go
+// instead, for trying the same flow by hand with a real file:
+//
+//	go run ./_example/envelope -serve 127.0.0.1:8080
+//
+// -max raises or removes the upload cap and -dir picks the storage directory,
+// which is what a multi-gigabyte test needs: the library has no size ceiling,
+// but a demo server with a default cap and a temp dir does.
+//
+//	go run ./_example/envelope -serve 127.0.0.1:8080 -max 0 -dir /tmp/enc
 package main
 
 import (
@@ -27,7 +43,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +57,25 @@ import (
 	"github.com/pilinux/crypt/envelope"
 )
 
+// streamHeaderSize mirrors the stream header the envelope package writes,
+// version(1) || saltLen(1) || salt || chunkSize(4) || noncePrefix, whose parts
+// are exported even though the total is not. The nonce prefix is what is left
+// of a nonce after the 8-byte chunk counter and the 1-byte final flag.
+const streamHeaderSize = 2 + envelope.SaltSize + 4 + envelope.NonceSize - 9
+
 func main() {
+	addr := flag.String("serve", "", "run the upload server on this address instead of the demos, e.g. 127.0.0.1:8080")
+	dir := flag.String("dir", "", "where the server keeps ciphertext (default: a fresh temp dir)")
+	limit := flag.Int64("max", defaultMaxUpload, "largest upload the server accepts, in bytes; 0 for no limit")
+	flag.Parse()
+	if *addr != "" {
+		if err := serve(*addr, *dir, *limit); err != nil {
+			fmt.Println("server:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// The application secret, typically read from an env var such as
 	// ENCRYPTION_SECRET. It must be at least envelope.MinSecretLength chars of
 	// machine-generated randomness (e.g. `openssl rand -hex 32`), never a
@@ -183,8 +222,14 @@ func main() {
 		return
 	}
 
-	// 11. Fingerprint a payload and mint a random file ID.
-	section("11. Helpers")
+	// 11. Seal an upload of unknown length, then pad it out of band.
+	if err := deferredPaddingDemo(masterKey); err != nil {
+		fmt.Println("deferred padding demo:", err)
+		return
+	}
+
+	// 12. Fingerprint a payload and mint a random file ID.
+	section("12. Helpers")
 	fmt.Println("  sha256:", envelope.Sha256Hex([]byte(plain)))
 	id, err := envelope.RandomHex(16)
 	if err != nil {
@@ -430,6 +475,140 @@ func paddingDemo(masterKey []byte) error {
 	//   scheme.SealPaddedFileAAD(masterKey, dstPath, srcPath, aad)
 	//   scheme.OpenPaddedFileAAD(masterKey, dstPath, srcPath, aad)
 	return nil
+}
+
+// deferredPaddingDemo handles browser uploads, where the size is unknown until
+// the bytes have all arrived. SealPaddedStream needs it up front, so it cannot
+// be used on the request path.
+//
+// Do it in two stages instead: SealStream the upload as it arrives (no size
+// needed), then pad it in a background job once the length is known. Neither
+// stage writes plaintext to disk, and a crash leaves a valid sealed object.
+//
+// Track what still needs padding in your own store: the two forms are
+// domain-separated, so an unpadded object fails as ErrStreamAuth instead of
+// announcing itself.
+func deferredPaddingDemo(masterKey []byte) error {
+	const chunkSize = envelope.MinChunkSize
+	scheme := envelope.New(envelope.Config{
+		KEKLabel:    "myapp:kek:v1",
+		SubKeyLabel: "myapp:data-subkey:v1",
+		ChunkSize:   chunkSize,
+	})
+
+	section("11. Deferred padding: seal an upload now, pad it later")
+
+	payload := make([]byte, 97531)
+	if _, err := rand.Read(payload); err != nil {
+		return err
+	}
+	aad := []byte("obj:42")
+
+	// Stage 1, the request path. This is exactly what a handler does with
+	// multipart.Part: no size, no temp file, one chunk of memory.
+	upload := browserUpload(payload)
+	var stored bytes.Buffer
+	n, err := scheme.SealStreamAAD(masterKey, &stored, upload, aad)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  stage 1 (request)   SealStreamAAD wants no size -> sealed %d bytes\n", n)
+	fmt.Printf("                      stored unpadded: %d bytes; content hidden, length not\n", stored.Len())
+
+	// Stage 2, the background job. The length is not stored anywhere: an
+	// unpadded stream is 37 + n + 16*ceil(n/chunkSize) bytes, and that inverts
+	// exactly. The leak padding exists to remove is what tells the padder how
+	// much to pad.
+	size, ok := plaintextLen(int64(stored.Len()), chunkSize)
+	fmt.Printf("                      length recovered from the sealed size alone = %d (exact=%t)\n",
+		size, ok && size == n)
+	if !ok {
+		return fmt.Errorf("could not recover the plaintext length")
+	}
+
+	r, err := scheme.OpenReaderAAD(masterKey, bytes.NewReader(stored.Bytes()), aad)
+	if err != nil {
+		return err
+	}
+	var padded bytes.Buffer
+	if _, err := scheme.SealPaddedStreamAAD(masterKey, &padded, r, size, aad); err != nil {
+		return err
+	}
+	fmt.Printf("  stage 2 (padder)    resealed padded: %d bytes (PaddedSize=%d, bucket hides the low bits)\n",
+		padded.Len(), envelope.PaddedSize(size))
+
+	// The padded object is what finally replaces the unpadded one, atomically.
+	var back bytes.Buffer
+	got, err := scheme.OpenPaddedStreamAAD(masterKey, &back, bytes.NewReader(padded.Bytes()), aad)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("                      round-trip: %d bytes, digests match = %t\n",
+		got, envelope.Sha256Hex(back.Bytes()) == envelope.Sha256Hex(payload))
+
+	// The two states cannot be confused: the padded helpers domain-separate
+	// their AAD, so neither reader accepts the other's stream. That costs the
+	// diagnosis, since a not-yet-padded object fails as ErrStreamAuth, the same
+	// as a wrong key. Retrying with the plain reader is what tells them apart.
+	_, err = scheme.OpenPaddedStreamAAD(masterKey, io.Discard, bytes.NewReader(stored.Bytes()), aad)
+	fmt.Printf("                      unpadded opened as padded fails = %t (%v)\n",
+		errors.Is(err, envelope.ErrStreamAuth), err)
+	_, err = scheme.OpenStreamAAD(masterKey, io.Discard, bytes.NewReader(stored.Bytes()), aad)
+	fmt.Printf("                      ...and the plain reader identifies it = %t\n", err == nil)
+	return nil
+}
+
+// browserUpload returns the file part of a plain multipart/form-data POST,
+// the way a browser sends it: a filename, and nowhere any byte count.
+func browserUpload(payload []byte) *multipart.Part {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	fw, err := w.CreateFormFile("file", "report.pdf")
+	if err == nil {
+		_, err = fw.Write(payload)
+	}
+	if err == nil {
+		err = w.Close()
+	}
+	if err != nil {
+		// building an in-memory form cannot realistically fail.
+		panic(err)
+	}
+
+	_, params, err := mime.ParseMediaType(w.FormDataContentType())
+	if err != nil {
+		panic(err)
+	}
+	part, err := multipart.NewReader(&body, params["boundary"]).NextPart()
+	if err != nil {
+		panic(err)
+	}
+	return part
+}
+
+// plaintextLen inverts the sealed size of an unpadded stream,
+// 37 + n + 16*ceil(n/chunkSize), so a padder can learn the payload length from
+// the file size without anything having recorded it. The tag count is the only
+// unknown, and it is bounded tightly enough to just try the few candidates.
+func plaintextLen(sealed, chunkSize int64) (int64, bool) {
+	body := sealed - streamHeaderSize
+	for chunks := body/(chunkSize+envelope.TagSize) - 1; chunks <= body/chunkSize+1; chunks++ {
+		if chunks < 1 {
+			continue
+		}
+		n := body - envelope.TagSize*chunks
+		if n < 0 {
+			continue
+		}
+		want := n/chunkSize + 1
+		if n > 0 && n%chunkSize == 0 {
+			want = n / chunkSize
+		}
+		if want == chunks {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // dumpStreamHeader prints the cleartext header at the start of a sealed

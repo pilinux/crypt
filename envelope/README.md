@@ -369,6 +369,44 @@ different number of bytes fails with `ErrSourceSize` rather than producing a
 frame that lies about its payload; `SealPaddedFile` removes the partial
 destination for you, a stream caller must discard `dst` itself.
 
+**When the length cannot be known up front, defer the padding.** An HTML
+multipart upload sends no per-part `Content-Length`, and the browser picks the
+file after the page loads, so nothing can state the length before the bytes
+arrive. Rather than staging the upload to learn its size, seal it with
+`SealStream`, which needs no size, and re-seal it padded in a background pass:
+
+```go
+n, err := scheme.SealStreamAAD(masterKey, dst, part, aad)   // request path
+r, err := scheme.OpenReaderAAD(masterKey, src, aad)         // background pass
+// n comes from stage 1 here, or back out of the sealed size
+_, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
+```
+
+The length need not be recorded anywhere: an unpadded stream is
+`streamHeaderSize + n + TagSize * ceil(n/chunkSize)` bytes, and that inverts
+exactly, so the very leak that padding exists to remove is what tells the padder
+how much to pad. A crash leaves a valid sealed object instead of a lost upload,
+and no plaintext touches disk in either stage.
+
+What the second pass costs is a window in which the object sits unpadded, one
+extra read and write per object, and a note of which objects are still owed
+one. That last part is not free, because the two formats are domain-separated
+(see [below](#reading-it-back)): an unpadded object opened as padded fails with
+`ErrStreamAuth`, the same as a wrong key. Retry with `OpenStream` to identify
+it, or record the state wherever you record the object.
+See [`_example/envelope`](../_example/envelope/main.go) section 11.
+
+**A wrong `size` is cheap, so it may come from an untrusted peer.** The
+mismatch is caught at the payload boundary, before any padding is generated, so
+`dst` receives one chunk at most, however large the declared size was. Checking
+only the sealed total at the end would be just as correct and quite ruinous: a
+caller declaring 1 TiB and then sending one byte would have ~16 GiB of zeros
+written before the mismatch surfaced, one byte in and gigabytes out, with the
+peer choosing the multiplier. As it is, that same call costs the 37-byte header
+and nothing else. An endpoint can therefore take a length from its client
+without handing over that lever, though bounding it against your own limit is
+still worth doing.
+
 #### Bucket policy
 
 `PaddedSize(n)` returns `padme(9 + n)`, the Padmé rule from
@@ -403,10 +441,42 @@ occupies whole trailing chunks, and only reading to the end authenticates them
 and the final-chunk flag. Stopping at the payload would silently accept a
 stream truncated inside its padding.
 
+The drain is **bounded**: the expected padding is computed from `PaddedSize`
+before reading, so a frame declaring a small payload inside a huge stream is
+rejected after a couple of chunks rather than after the whole file. The stream
+must then end exactly there. That comparison is not needed to recover the
+payload, but it pins the format: a sealer using a different bucket rule, or a
+`padme` quietly changed without bumping `paddingVersion`, produces blobs that
+stop opening rather than blobs that open as something else.
+
+Treat `dst` as provisional until the call returns `nil`: the payload reaches it
+before the trailing padding chunks are authenticated, so a stream truncated
+inside its padding leaves a complete payload next to a non-nil error.
+`OpenPaddedFile` removes the partial destination for you, which is the reason
+to prefer it when the destination is a file.
+
+**The two formats are domain-separated by AAD.** Both padded helpers prepend a
+fixed `paddedAADTag` to the caller's AAD. It is never stored, so a padded file
+and a plain one are byte-identical in shape and the header still does not
+announce which is which, yet neither reader can be fooled into accepting the
+other's stream. Without it, detection would rest on a version byte plus a
+length that ordinary framed data could imitate, and a false accept would mean
+silently truncating a payload.
+
+The price is diagnosis: a plain stream opened as padded fails with
+`ErrStreamAuth`, the same as a wrong key. To tell those apart, retry with
+`OpenStream` over a fresh reader, which succeeds only in the unpadded case. It
+also shifts what `ErrNoPaddingFrame` means: no longer "sealed before padding
+existed", but "padded in a format newer than this reader". The tag deliberately
+carries no version, and `paddingVersion` stays inside the authenticated
+plaintext, which is where a future opener will dispatch on it.
+
 | Situation | Error |
 | --- | --- |
-| stream sealed without padding, or a frame that does not fit its stream | `ErrNotPadded` |
-| source is not a regular file, changed size while being sealed, or did not deliver the declared `size` | `ErrSourceSize` |
+| stream sealed without padding, or with a different AAD or key | `ErrStreamAuth`, before any frame is read |
+| authenticated as padded but carrying no frame, i.e. a newer padded format | `ErrNoPaddingFrame` (wraps `ErrNotPadded`) |
+| a frame was read and the stream then contradicted it: too little payload, or a padding length `PaddedSize` would not have produced | `ErrPaddingMalformed` (wraps `ErrNotPadded`) |
+| source is not a regular file, changed size while being sealed, or did not deliver the declared `size` (caught at the payload boundary, before any padding is written) | `ErrSourceIrregular`, `ErrSourceShort` or `ErrSourceLong`, all matching `ErrSourceSize` |
 | padding chunks removed, reordered or altered | `ErrStreamAuth`, thanks to the drain |
 
 Padding hides the length and nothing else. The file name, the directory, the
@@ -598,12 +668,25 @@ numbers.
 
 - `paddingVersion` = `0x01`, `paddingFrameSize` = 9 (unexported): the frame
   sealed ahead of the payload, `version(1) || realLen(8 BE)`.
-- `ErrNotPadded`: the stream authenticates but its plaintext is not a padded
-  frame, for example a stream sealed by `SealFile`.
-- `ErrSourceSize`: source is not a regular file, changed size while being
-  sealed, or did not deliver the `size` a stream caller declared. Padding is
-  computed from the size up front, so a source that moves underneath the sealer
-  cannot produce a well-formed padded stream.
+- `ErrNotPadded`: the umbrella for a stream that authenticates as padded and
+  then cannot be read as one. Match it to catch the class, the two sentinels
+  under it to tell which case. An ordinary `SealFile` stream never gets this
+  far: the domain-separated AAD stops it at `ErrStreamAuth`.
+- `ErrNoPaddingFrame`: authenticated, but the plaintext carries no frame, so
+  the padded format is newer than this reader.
+- `ErrPaddingMalformed`: a frame was read and the stream then contradicted it,
+  with too little payload or with a padding length `PaddedSize` would never
+  have produced.
+- `ErrSourceSize`: the umbrella for a source that could not supply the byte
+  count the padding was computed for. Padding is fixed before the first chunk
+  is sealed, so a source that moves underneath the sealer cannot produce a
+  well-formed padded stream.
+- `ErrSourceIrregular`: a `SealPaddedFile` source is not a regular file, so it
+  has no size to pad against.
+- `ErrSourceShort` / `ErrSourceLong`: which way a source missed its declared
+  size. Both wrap `ErrSourceSize`, so `errors.Is` against that still matches
+  either, while a caller that must tell "retry the upload" from "reject it" can
+  branch on the specific one.
 - `PaddedSize(n)`: the padded plaintext length for an n-byte payload, `padme(9 + n)`.
   Exported so callers can budget storage; returns 0 for a negative or
   unrepresentable n.
@@ -612,14 +695,54 @@ numbers.
   leaves the length unpadded rather than wrapping.
 - `zeroReader`: an endless run of zeros. The padding is XORed with the
   keystream like real data, so zeros are indistinguishable once sealed.
+- `exactReader`: yields exactly `size` bytes from `src`, then EOF, failing with
+  `ErrSourceSize` the moment `src` runs short or long. It bounds what a wrong
+  or hostile size can cost: the mismatch is caught before any padding is
+  generated, so `dst` receives at most one chunk instead of the whole Padmé
+  bucket. `src` is whatever the caller passed, so the reader is deliberately
+  suspicious of it:
+  - it never reads `src` again once `src` has reported `io.EOF`, since a
+    drained reader may close itself and answer `os.ErrClosed`, which would fail
+    a payload that was in fact complete;
+  - its errors are sticky, like `StreamWriter` and `StreamReader`, so a retry
+    after a failure cannot get a different answer;
+  - a zero-length read is answered `(0, nil)` without touching `src`, the one
+    case the `io.Reader` contract calls out for that return;
+  - a read count outside `0..len(p)`, or a negative remainder, would drive the
+    slice expression out of range, so both are refused rather than risked
+    (`bufio` panics here; this package fails closed);
+  - a legal `(0, nil)` read is retried instead of taken for EOF, which would
+    silently truncate the source. The retry gives up after
+    `maxConsecutiveEmptyReads` (100) with `io.ErrNoProgress`, on **both** the
+    end-of-payload probe and the fill. Bounding only the probe would not stop a
+    source that answers that way forever, it would move the spin into the
+    caller's `io.ReadFull`.
+
+  Both the bound and the error are the ones `bufio` uses for the same
+  situation.
+
+  **Detecting trailing data costs one byte of `src`**, and that is part of the
+  contract rather than a bug: it cannot be pushed back through a plain
+  `io.Reader`, and buffering it internally would not help, since the read still
+  drains `src` and the buffer dies with the reader. `ErrSourceLong` says so in
+  its own message, so the cost is visible at the failure and not only here. A
+  caller sealing one frame out of a longer stream should pass
+  `io.LimitReader(src, size)`, which reports EOF at exactly the right point and
+  is never probed past it.
+
+  The trailing check only runs if something drives the reader to its end, so
+  `SealPaddedStreamAAD` **verifies that it did** (`reachedEnd`) instead of
+  inheriting the guarantee from the caller's read pattern: `io.MultiReader`
+  drains the payload because it advances to the padding only on `io.EOF`, but
+  that is `io.MultiReader`'s property, not this reader's.
 - `(*Scheme) SealPaddedStream(masterKey, dst, src, size)` → `SealPaddedStreamAAD(..., nil)`.
 - `(*Scheme) SealPaddedStreamAAD(masterKey, dst, src, size, aad)`: the padded
-  primitive. `io.MultiReader(frame, src, zeros)` → `SealStreamAAD`, then check
-  the sealed total against `PaddedSize` so a source that declared or changed
-  its size fails (`ErrSourceSize`) instead of writing a frame that lies about
-  the payload. Returns the real payload length, not the padded one. Nothing
-  beyond one chunk is buffered, so an in-memory blob, an HTTP body or a pipe is
-  padded and sealed on the fly.
+  primitive. `io.MultiReader(frame, exactReader{src}, zeros)` → `SealStreamAAD`,
+  with the sealed total checked against `PaddedSize` as a backstop, so a source
+  that declared or changed its size fails (`ErrSourceSize`) instead of writing a
+  frame that lies about the payload. Returns the real payload length, not the
+  padded one. Nothing beyond one chunk is buffered, so an in-memory blob, an
+  HTTP body or a pipe is padded and sealed on the fly.
 - `(*Scheme) OpenPaddedStream(masterKey, dst, src)` → `OpenPaddedStreamAAD(..., nil)`.
 - `(*Scheme) OpenPaddedStreamAAD(masterKey, dst, src, aad)`: `OpenReaderAAD` →
   read the frame → `io.CopyN` the payload → **drain the rest**. The drain
@@ -648,5 +771,5 @@ Small helpers, unrelated to key derivation.
 - `cipher_test.go`: salt generation, sub-key derivation, Seal/Open round-trips and tamper cases for bytes, string and int64, AAD mismatch.
 - `stream_test.go`: round-trips and sizes (`sealedSize`), AAD, wrong key, integrity (reorder, duplicate, drop, truncate, bit flip), envelope/stream separation, chunk-size handling, sticky errors both ways, header codec, nonce layout, and `TestStreamAllocationsPerChunk` (1-chunk versus 100-chunk allocations, guarding the no-per-chunk-allocation property).
 - `file_test.go`: file round-trip with and without AAD, refusal to overwrite an existing destination, missing source, partial output removed on corruption.
-- `padding_test.go`: `PaddedSize` values, monotonicity and the 12% overhead cap, padded round-trips across the chunk boundary cases (file and in-memory stream), AAD, the length-hiding property (three payload sizes, one file size), stream/file format interop, padding-only truncation caught by the drain, unpadded and malformed frames rejected, irregular source, size mismatch in both directions.
+- `padding_test.go`, in four groups: the bucket rule (`PaddedSize` values, monotonicity, the 12% overhead cap); round-trips across the chunk boundary cases, in a file and in memory, with and without AAD, plus the length-hiding property (three payload sizes, one file size) and stream/file interop; the rejections (unpadded and malformed frames, an irregular source, a size mismatch either way with the write to `dst` capped at one chunk, padding-only truncation caught by the drain, and the drain itself bounded against an oversized stream); and one test per `exactReader` guard, since each guard exists for a source that misbehaves in exactly one way: legal empty reads, a stall on `(0, nil)` forever, a reader that closes itself at EOF, sticky errors and sticky EOF, zero-length reads, an invalid read count, and the short-versus-long messages.
 - `hash_test.go`: `Sha256Hex` against known digests, `RandomHex` length and uniqueness.
