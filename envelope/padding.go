@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"math/bits"
@@ -43,46 +44,102 @@ import (
 )
 
 const (
-	// paddingVersion tags the padded frame so a stream that authenticates but
-	// does not carry a padded payload is rejected explicitly. It is the first
-	// byte of the sealed *plaintext*, not of the file: the file still begins
-	// with streamVersion (0x81). Sharing a value with envelopeVersion is
-	// therefore harmless, since the two are never read from the same place.
+	// paddingVersion is the first byte of the sealed plaintext, not of the
+	// file, so sharing a value with envelopeVersion is harmless.
 	paddingVersion byte = 0x01
 
 	// paddingFrameSize is the frame that precedes the payload inside the
 	// sealed plaintext: version(1) || realLen(8, big-endian).
 	paddingFrameSize = 9
+
+	// maxConsecutiveEmptyReads is how often a source may answer "no bytes, no
+	// error" before we stop waiting on it. That reply is legal, so the first few
+	// are retried; a source that only ever replies so is legal too, and would
+	// spin a core. The bound and io.ErrNoProgress come from bufio, so a reader
+	// the rest of Go tolerates is tolerated here.
+	maxConsecutiveEmptyReads = 100
+
+	// paddedAADTag keeps padded and plain streams apart. Only the padded sealer
+	// and opener prepend it to the caller's AAD, so neither reader can open the
+	// other's stream; it is never written, so both formats share the same header
+	// and a file still does not advertise whether it is padded.
+	//
+	// The tag carries no version on purpose: paddingVersion sits inside the
+	// authenticated plaintext, so a future padded format still authenticates
+	// here and can be dispatched on that byte.
+	paddedAADTag = "pilinux/crypt/envelope:padded"
 )
 
-// Errors returned by the padded helpers.
+// paddedAAD prefixes aad with the padded-format domain tag. The tag is a
+// fixed-length constant, so the concatenation is unambiguous.
+func paddedAAD(aad []byte) []byte {
+	out := make([]byte, 0, len(paddedAADTag)+len(aad))
+	out = append(out, paddedAADTag...)
+	return append(out, aad...)
+}
+
+// Errors returned by the padded helpers. The two umbrellas, ErrNotPadded and
+// ErrSourceSize, carry no cause of their own so the sentinels wrapping them
+// read correctly when concatenated; match the umbrella to catch a class, the
+// sentinel to branch on a case.
 var (
-	// ErrNotPadded is returned when a stream authenticates but its plaintext
-	// is not the frame written by the padded sealers, for example a stream
-	// sealed by [Scheme.SealStream] or [Scheme.SealFile].
-	ErrNotPadded = errors.New("envelope: sealed stream carries no padded payload")
+	// ErrNotPadded means a stream could not be read as a padded one.
+	ErrNotPadded = errors.New("envelope: not a readable padded stream")
 
-	// ErrSourceSize is returned when the source does not deliver the number of
-	// bytes the padding was computed for: a [Scheme.SealPaddedFile] source that
-	// is not a regular file or changed size while it was being sealed, or a
-	// [Scheme.SealPaddedStream] src that did not deliver exactly the declared
-	// size. Padding is computed from the size up front, so a source that moves
-	// underneath the sealer cannot produce a well-formed padded stream.
-	ErrSourceSize = errors.New("envelope: source must be a regular file of stable size")
+	// ErrNoPaddingFrame means a stream authenticated as padded but its plaintext
+	// holds no frame: too short for one, or a first byte that is not
+	// paddingVersion. Since the AAD is domain-separated, an ordinary
+	// [Scheme.SealStream] blob never gets this far; the live case is a padded
+	// format newer than this reader, which authenticates and is then rejected
+	// on its version byte.
+	ErrNoPaddingFrame = fmt.Errorf("%w: no padding frame", ErrNotPadded)
+
+	// ErrPaddingMalformed means a frame was read and the stream then
+	// contradicted it: too little payload, or a padding length PaddedSize would
+	// not have produced. Unlike ErrNoPaddingFrame the stream does claim to be
+	// padded, so this is a broken file rather than an unpadded one.
+	ErrPaddingMalformed = fmt.Errorf("%w: frame contradicts the payload it describes", ErrNotPadded)
+
+	// ErrSourceSize means a source could not supply the byte count the padding
+	// was computed for. Returned bare when the count itself is unusable, and
+	// wrapped by the sentinels below for the reasons a source can miss it.
+	ErrSourceSize = errors.New("envelope: source size is not usable for padding")
+
+	// ErrSourceIrregular means a [Scheme.SealPaddedFile] source is not a
+	// regular file, so it has no size to pad against.
+	ErrSourceIrregular = fmt.Errorf("%w: source is not a regular file", ErrSourceSize)
+
+	// ErrSourceShort and ErrSourceLong say which way the source missed. Branch
+	// on them when the direction drives the response, since a truncated upload
+	// is worth retrying and an overlong one is not. Detecting extra data costs
+	// one byte of src that cannot be pushed back, so frame a payload inside a
+	// longer stream with io.LimitReader.
+	ErrSourceShort = fmt.Errorf("%w: source ended before the declared size", ErrSourceSize)
+	ErrSourceLong  = fmt.Errorf("%w: source holds more data than the declared size (one byte consumed)", ErrSourceSize)
+
+	// errBadReadCount: the source returned a count outside 0..len(p).
+	errBadReadCount = errors.New("envelope: source returned an invalid read count")
+
+	// errNegativeRemainder: an exactReader was built with a negative count,
+	// which PaddedSize screens out ahead of the only construction site. Kept
+	// distinct from errBadReadCount so the blame lands on the caller, not on r.
+	errNegativeRemainder = errors.New("envelope: negative payload size in the padded sealer")
+
+	// errPaddingInvariant: a post-condition of the sealer did not hold. Nothing
+	// a source does can cause it, so it is deliberately not an ErrSource* value
+	// that would send the report to the caller instead of to this package.
+	errPaddingInvariant = errors.New("envelope: padded sealer post-condition failed")
 )
 
-// PaddedSize reports the padded plaintext length [Scheme.SealPaddedStream]
-// and [Scheme.SealPaddedFile] use for a payload of n bytes:
-// the 9-byte frame plus n, rounded up by the Padmé
-// rule (Nikitin et al., "Reducing Metadata Leakage from Encrypted Files",
-// PoPETs 2019). Padmé keeps only the top log2(log2(L)) bits of the length
-// significant, which caps the overhead near 12% and leaves it around 3% on
-// average, while collapsing every length inside one bucket onto a single
-// on-disk size.
+// PaddedSize reports the padded plaintext length used for an n-byte payload:
+// the 9-byte frame plus n, rounded up by the Padmé rule (Nikitin et al.,
+// "Reducing Metadata Leakage from Encrypted Files", PoPETs 2019). Padmé keeps
+// only the top log2(log2(L)) bits of a length significant, which caps overhead
+// near 12% and collapses every length in a bucket onto one on-disk size.
 //
-// The resulting file is streamHeaderSize + PaddedSize(n) + TagSize*chunks
-// bytes, with chunks = ceil(PaddedSize(n)/chunkSize). It returns 0 for a
-// negative n, or for an n so large that the frame cannot be added.
+// The sealed file is streamHeaderSize + PaddedSize(n) + TagSize*chunks bytes,
+// with chunks = ceil(PaddedSize(n)/chunkSize). Returns 0 for a negative n, or
+// one too large to frame.
 func PaddedSize(n int64) int64 {
 	if n < 0 || n > math.MaxInt64-paddingFrameSize {
 		return 0
@@ -90,16 +147,19 @@ func PaddedSize(n int64) int64 {
 	return padme(n + paddingFrameSize)
 }
 
-// padme rounds l up so that only its top log2(log2(l)) bits are significant.
-// The bucket width at length l is 2^(floor(log2 l) - floor(log2 log2 l) - 1),
-// so the padding is proportional to the length instead of a fixed block size.
+// padme rounds l up so only its top log2(log2(l)) bits are significant, a
+// bucket width of 2^(floor(log2 l) - floor(log2 log2 l) - 1).
+//
+// It is frozen for paddingVersion 0x01. OpenPaddedStreamAAD checks the padding
+// it drains against PaddedSize, so changing this rule does not merely reinter-
+// pret old files, it makes every one of them unreadable. A new rule needs a new
+// paddingVersion and an opener that dispatches on it, not just a new constant.
 func padme(l int64) int64 {
 	if l < 4 {
 		return l
 	}
 
-	// l >= 4 here, so both conversions are of a positive value and the
-	// exponents below are at least 2 and 1 respectively.
+	// l >= 4, so both conversions take a positive value.
 	e := bits.Len64(uint64(l)) - 1 // #nosec G115 -- floor(log2 l)
 	s := bits.Len64(uint64(e))     // #nosec G115 -- floor(log2 e) + 1
 	z := e - s
@@ -109,22 +169,138 @@ func padme(l int64) int64 {
 
 	mask := int64(1)<<z - 1
 	if l > math.MaxInt64-mask {
-		// rounding would overflow; leave an absurd length unpadded rather
-		// than wrapping around to a shorter one.
+		// leave an absurd length unpadded rather than wrapping it shorter
 		return l
 	}
 	return (l + mask) &^ mask
 }
 
-// zeroReader is an endless source of zero bytes. The padding is XORed with the
-// keystream like any other plaintext, so zeros are indistinguishable from real
-// data once sealed and cost nothing to produce.
+// zeroReader is an endless source of zeros. Padding is keystream-XORed like any
+// other plaintext, so zeros are indistinguishable from data once sealed.
 type zeroReader struct{}
 
 // Read fills p with zeros and never fails.
 func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
+}
+
+// exactReader yields exactly left bytes from r, then EOF, failing as soon as r
+// proves shorter or longer. Catching the mismatch here is what keeps a wrong
+// size cheap: the padding is generated only afterwards, so a caller who
+// declares a terabyte and delivers nothing gets an error rather than a whole
+// Padmé bucket written to dst.
+//
+// r is caller-supplied, so Read is defensive. It never re-reads r after EOF (a
+// drained reader may answer os.ErrClosed), keeps errors sticky, answers a
+// zero-length read without touching r, rejects a count that would drive left
+// negative, and gives up with io.ErrNoProgress on a source that only ever
+// returns (0, nil). What it cannot promise is on atEnd.
+type exactReader struct {
+	r     io.Reader
+	left  int64 // payload bytes still owed by r
+	empty int   // consecutive (0, nil) reads from r, reset by any progress
+	eof   bool  // r has reported io.EOF, so it must not be read again
+	err   error // sticky: the first failure, or io.EOF, ends the reader
+}
+
+// Read fills p from r, never past the declared size.
+func (e *exactReader) Read(p []byte) (int, error) {
+	// Checked ahead of the zero-length case on purpose: a finished reader
+	// answers every call alike. Do not reorder.
+	if e.err != nil {
+		return 0, e.err
+	}
+	if len(p) == 0 {
+		// Must not reach atEnd, which would consume a byte of r.
+		return 0, nil
+	}
+	if e.left < 0 {
+		// Unreachable today; guarded so p[:e.left] can never panic.
+		return 0, e.fail(errNegativeRemainder)
+	}
+	if e.left == 0 {
+		return 0, e.fail(e.atEnd())
+	}
+
+	if int64(len(p)) > e.left {
+		p = p[:e.left]
+	}
+	n, err := e.r.Read(p)
+	if n < 0 || n > len(p) {
+		return 0, e.fail(errBadReadCount)
+	}
+	e.left -= int64(n)
+
+	if errors.Is(err, io.EOF) {
+		e.eof = true
+		if e.left > 0 {
+			return n, e.fail(fmt.Errorf("%w: %d bytes missing", ErrSourceShort, e.left))
+		}
+		// Exactly the declared length. Hold the EOF back so the next call still
+		// runs atEnd, which will not re-read r now that eof is set.
+		err = nil
+	}
+	if err != nil {
+		return n, e.fail(err)
+	}
+	if n == 0 {
+		// Passed up as the contract says, but not forever: the same bound as
+		// atEnd, or the caller's io.ReadFull spins instead of this loop.
+		e.empty++
+		if e.empty >= maxConsecutiveEmptyReads {
+			return 0, e.fail(io.ErrNoProgress)
+		}
+		return 0, nil
+	}
+	e.empty = 0
+	return n, nil
+}
+
+// atEnd reports how the payload ended: io.EOF if r is exhausted, ErrSourceLong
+// if it holds more, since stopping quietly would seal a frame that silently
+// truncates the source.
+//
+// Two costs. Finding that extra byte consumes it, and a plain io.Reader has
+// nowhere to push it back, so src must not be read on after ErrSourceLong; pass
+// io.LimitReader(src, size) to keep a framed payload intact. And the check runs
+// only if something drives the reader to its end, which is why
+// SealPaddedStreamAAD verifies reachedEnd instead of trusting the read pattern.
+func (e *exactReader) atEnd() error {
+	if e.eof {
+		return io.EOF // already answered; re-reading r is pointless and unsafe
+	}
+
+	var probe [1]byte
+	for i := maxConsecutiveEmptyReads; i > 0; i-- {
+		n, err := e.r.Read(probe[:])
+		switch {
+		case n > 0:
+			return ErrSourceLong
+		case errors.Is(err, io.EOF):
+			e.eof = true
+			return io.EOF
+		case err != nil:
+			// named, so a drain failure is not mistaken for a payload one
+			return fmt.Errorf("envelope: checking for data past the declared size: %w", err)
+		}
+		// (0, nil) means nothing happened; ask again rather than call it EOF.
+	}
+	return io.ErrNoProgress
+}
+
+// reachedEnd reports whether r was driven far enough to confirm its size, which
+// is also the point where trailing data would have been caught.
+func (e *exactReader) reachedEnd() bool { return e.eof }
+
+// fail records err as the terminal state and returns it unchanged, so every
+// later call answers identically. io.EOF is recorded too, which is what makes
+// the end of the payload idempotent.
+func (e *exactReader) fail(err error) error {
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+	return err
 }
 
 // SealPaddedFile seals srcPath into a newly created dstPath, padding the
@@ -136,14 +312,12 @@ func (s *Scheme) SealPaddedFile(masterKey []byte, dstPath, srcPath string) (int6
 
 // SealPaddedFileAAD seals srcPath into a newly created dstPath with the
 // payload padded to [PaddedSize], binding aad into every chunk, and returns
-// the number of real payload bytes sealed (not the padded length). Like
+// the number of real payload bytes sealed. Like
 // [Scheme.SealFileAAD] it streams chunk by chunk and refuses to overwrite an
 // existing destination.
 //
-// Only the length is hidden, and only to within one Padmé bucket. Everything
-// the filesystem records around the file, above all its name, leaks
-// independently: give sealed files opaque names (see [RandomHex]) if that
-// matters.
+// Only the length is hidden, and only to within one Padmé bucket. File names,
+// timestamps and access patterns leak independently; see [RandomHex].
 func (s *Scheme) SealPaddedFileAAD(masterKey []byte, dstPath, srcPath string, aad []byte) (int64, error) {
 	return pipeFile(dstPath, srcPath, func(dst io.Writer, src *os.File) (int64, error) {
 		info, err := src.Stat()
@@ -151,8 +325,7 @@ func (s *Scheme) SealPaddedFileAAD(masterKey []byte, dstPath, srcPath string, aa
 			return 0, err
 		}
 		if !info.Mode().IsRegular() {
-			// a pipe or device has no meaningful size to pad against.
-			return 0, ErrSourceSize
+			return 0, ErrSourceIrregular
 		}
 		return s.SealPaddedStreamAAD(masterKey, dst, src, info.Size(), aad)
 	})
@@ -167,10 +340,13 @@ func (s *Scheme) OpenPaddedFile(masterKey []byte, dstPath, srcPath string) (int6
 
 // OpenPaddedFileAAD opens a file sealed by [Scheme.SealPaddedFileAAD] into a
 // newly created dstPath, verifying aad, and returns the number of payload
-// bytes recovered. The padding is read and authenticated but not written out.
+// bytes recovered. The padding is authenticated but not written out. Failures
+// are [ErrNoPaddingFrame] or [ErrPaddingMalformed], both matching [ErrNotPadded].
 //
-// A stream that authenticates but was not sealed with padding fails with
-// [ErrNotPadded].
+// Prefer this over [Scheme.OpenPaddedStreamAAD] when the destination is a file:
+// payload reaches dst before the trailing padding is authenticated, and this
+// form removes the partial dst on any error, which the stream form leaves to
+// the caller.
 func (s *Scheme) OpenPaddedFileAAD(masterKey []byte, dstPath, srcPath string, aad []byte) (int64, error) {
 	return pipeFile(dstPath, srcPath, func(dst io.Writer, src *os.File) (int64, error) {
 		return s.OpenPaddedStreamAAD(masterKey, dst, src, aad)
@@ -184,22 +360,28 @@ func (s *Scheme) SealPaddedStream(masterKey []byte, dst io.Writer, src io.Reader
 	return s.SealPaddedStreamAAD(masterKey, dst, src, size, nil)
 }
 
-// SealPaddedStreamAAD frames size bytes read from src, appends zero padding
-// out to [PaddedSize] and seals the result to dst as one stream, binding aad
-// into every chunk. It returns the number of real payload bytes sealed, not
-// the padded length.
+// SealPaddedStreamAAD reads size bytes from src, pads them out to [PaddedSize]
+// and seals the result to dst as one stream, binding aad into every chunk. It
+// returns the real payload length, not the padded one.
 //
-// This is the reader/writer form of [Scheme.SealPaddedFileAAD], and the one to
-// reach for when the payload is not already a file: the padding is generated
-// as the sealer asks for it and only one chunk is ever buffered, so an
-// in-memory blob, an HTTP body or a pipe is padded and sealed on the fly
-// instead of being staged on disk first.
+// Use it when the plaintext is not a file: a buffer, an HTTP body, a pipe.
+// Padding is generated as the sealer asks for it and only one chunk is
+// buffered, so nothing is staged on disk. [Scheme.SealPaddedFileAAD] is this
+// with size taken from a Stat.
 //
-// size must be the exact number of bytes src will deliver. The Padmé bucket is
-// computed from it before the first chunk is sealed, which is why the length
-// cannot simply be discovered at the end; a src that delivers a different
-// number of bytes fails with [ErrSourceSize] rather than producing a frame
-// that lies about its payload.
+// size must match what src actually delivers, because the padded length is
+// fixed before the first chunk is sealed. A short or long source fails at the
+// payload boundary with [ErrSourceShort] or [ErrSourceLong] before any padding
+// is written, so a wrong size costs a header rather than gigabytes of zeros,
+// which is what makes size safe to take from an untrusted peer. dst is then
+// left holding a partial stream no reader will accept; discarding it is the
+// caller's job (the file wrappers do it for you), and the returned count is the
+// padded bytes written so far.
+//
+// Only [Scheme.OpenPaddedStreamAAD] can read this back, never
+// [Scheme.OpenStreamAAD]: the AAD domain-separates the two formats. The bytes
+// on disk are unchanged, so a sealed file still does not reveal that it is
+// padded.
 func (s *Scheme) SealPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Reader, size int64, aad []byte) (int64, error) {
 	target := PaddedSize(size)
 	if target == 0 {
@@ -208,25 +390,31 @@ func (s *Scheme) SealPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Rea
 
 	var frame [paddingFrameSize]byte
 	frame[0] = paddingVersion
-	// size is non-negative (PaddedSize rejected anything else), so the
-	// conversion is the plain two's-complement round-trip read back below.
+	// size >= 0 (PaddedSize rejected anything else), so this is the plain
+	// two's-complement round-trip read back below.
 	binary.BigEndian.PutUint64(frame[1:], uint64(size)) // #nosec G115
 
+	payload := &exactReader{r: src, left: size}
 	padded := io.MultiReader(
 		bytes.NewReader(frame[:]),
-		src,
+		payload,
 		io.LimitReader(zeroReader{}, target-paddingFrameSize-size),
 	)
 
-	n, err := s.SealStreamAAD(masterKey, dst, padded, aad)
+	n, err := s.SealStreamAAD(masterKey, dst, padded, paddedAAD(aad))
 	if err != nil {
 		return n, err
 	}
+	if !payload.reachedEnd() {
+		// Nothing drove src to its end, so it was never checked for trailing
+		// data. io.MultiReader does drive it, but that is io.MultiReader's
+		// property rather than exactReader's.
+		return n, errPaddingInvariant
+	}
 	if n != target {
-		// src delivered more or fewer bytes than the declared size, so the
-		// frame no longer describes the payload. The file wrappers remove the
-		// destination; a stream caller must discard dst itself.
-		return n, ErrSourceSize
+		// Belt and braces: exactReader already enforces the payload length, so
+		// reaching here means the frame or padding arithmetic is wrong.
+		return n, errPaddingInvariant
 	}
 	return size, nil
 }
@@ -239,14 +427,23 @@ func (s *Scheme) OpenPaddedStream(masterKey []byte, dst io.Writer, src io.Reader
 
 // OpenPaddedStreamAAD opens a stream sealed by [Scheme.SealPaddedStreamAAD]
 // into dst, verifying aad, and returns the number of payload bytes written. It
-// reads the frame, copies out exactly that many bytes and then drains the
-// padding; the drain is what authenticates the padding-only trailing chunks
-// and the final-chunk flag, so a stream truncated inside its padding fails.
+// reads the frame, copies out exactly that many bytes, then drains exactly the
+// padding [PaddedSize] calls for and requires the stream to end there.
 //
-// A stream that authenticates but was not sealed with padding fails with
-// [ErrNotPadded].
+// Padded and plain streams are domain-separated by AAD, so neither reader can
+// be fooled into accepting the other's data, and the two still share a
+// byte-identical header on disk. The price is that an ordinary
+// [Scheme.SealStream] blob fails here as [ErrStreamAuth], indistinguishable
+// from a wrong key: to tell those apart, retry with [Scheme.OpenStreamAAD] over
+// a fresh reader, which succeeds only for the unpadded case.
+//
+// Payload reaches dst before the trailing padding chunks are authenticated.
+// Nothing forged gets through, since every chunk is authenticated as it is
+// read, but a stream truncated inside its padding leaves dst holding a complete
+// payload alongside a non-nil error. Treat dst as provisional until this
+// returns nil.
 func (s *Scheme) OpenPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Reader, aad []byte) (int64, error) {
-	r, err := s.OpenReaderAAD(masterKey, src, aad)
+	r, err := s.OpenReaderAAD(masterKey, src, paddedAAD(aad))
 	if err != nil {
 		return 0, err
 	}
@@ -254,33 +451,61 @@ func (s *Scheme) OpenPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Rea
 	var frame [paddingFrameSize]byte
 	if _, err := io.ReadFull(r, frame[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return 0, ErrNotPadded
+			return 0, ErrNoPaddingFrame
 		}
 		return 0, err
 	}
 	if frame[0] != paddingVersion {
-		return 0, ErrNotPadded
+		return 0, ErrNoPaddingFrame
 	}
 	size := binary.BigEndian.Uint64(frame[1:])
 	if size > math.MaxInt64 {
-		return 0, ErrNotPadded
+		return 0, ErrPaddingMalformed
 	}
 
 	written, err := io.CopyN(dst, r, int64(size)) // #nosec G115 -- bounded above
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			// the frame claims more payload than the stream holds.
-			return written, ErrNotPadded
+			// the frame claims more payload than the stream holds
+			return written, ErrPaddingMalformed
 		}
 		return written, err
 	}
 
-	// Draining is not optional: the padding occupies whole trailing chunks,
-	// and only reading to the end authenticates them and the final-chunk flag.
+	// How much padding the sealer must have written. Knowing it up front is
+	// what lets the drain below be bounded rather than open-ended: everything
+	// read is authenticated, so a hostile blob is not a forgery risk, but a
+	// frame claiming a small payload inside a huge stream should not be able to
+	// make the reader chew through all of it before complaining. want is at
+	// least size+paddingFrameSize because padme never contracts, so the
+	// subtraction cannot go negative.
+	want := PaddedSize(int64(size)) // #nosec G115 -- bounded above
+	if want == 0 {
+		return written, ErrPaddingMalformed
+	}
+	expect := want - paddingFrameSize - int64(size)
+
+	// Draining is not optional: the padding fills whole trailing chunks, and
+	// only reading to the end authenticates them and the final-chunk flag.
 	// Stopping at the payload would accept a stream truncated inside its
 	// padding.
-	if _, err := io.Copy(io.Discard, r); err != nil {
+	if _, err := io.CopyN(io.Discard, r, expect); err != nil {
+		if errors.Is(err, io.EOF) {
+			return written, ErrPaddingMalformed
+		}
 		return written, err
 	}
-	return written, nil
+
+	// The padding ended where PaddedSize says it should, so the stream must end
+	// here too. This read is also what authenticates the final-chunk flag when
+	// the padding lands on a chunk boundary.
+	var probe [1]byte
+	switch n, err := io.ReadFull(r, probe[:]); {
+	case n > 0:
+		return written, ErrPaddingMalformed
+	case errors.Is(err, io.EOF):
+		return written, nil
+	default:
+		return written, err
+	}
 }
