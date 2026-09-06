@@ -210,7 +210,7 @@ This is the part that differs most from the single-shot format.
 | sub-key (32) = `HKDF-SHA256(masterKey, salt, SubKeyLabel)` | final flag, `0x00` until the last chunk, `0x01` on it |
 | nonce prefix (15, random) | the full 24-byte nonce built from those two |
 | AEAD instance (`chacha20poly1305.NewX(subKey)`) | the 16-byte tag |
-| additional data = `header (37) \|\| callerAAD` | |
+| additional data = `header (37) \|\| SHA-256(len(tag) \|\| tag \|\| callerAAD)` (`streamAuthData`) | |
 
 **Every chunk of one stream is sealed under the same sub-key.** There is no
 per-chunk HKDF, no per-chunk salt and no per-chunk random nonce. Uniqueness
@@ -474,21 +474,40 @@ skipped to reach the tail, since this package does not read an unbounded amount
 behind the caller's back; a reader being abandoned holds nothing, so it can just
 be dropped.
 
-**The two formats are domain-separated by AAD.** Both padded helpers prepend a
-fixed `paddedAADTag` to the caller's AAD. It is never stored, so a padded file
-and a plain one are byte-identical in shape and the header still does not
-announce which is which, yet neither reader can be fooled into accepting the
-other's stream. Without it, detection would rest on a version byte plus a
-length that ordinary framed data could imitate, and a false accept would mean
-silently truncating a payload.
+**The two formats are domain-separated by AAD.** Every stream authenticates a
+format tag, `pilinux/crypt/envelope:stream:v1` for a plain one and
+`pilinux/crypt/envelope:padded:v1` for a padded one. The tag is never stored,
+so a padded file and a plain one are byte-identical in shape and the header
+still does not announce which is which, yet neither reader can be fooled into
+accepting the other's stream. Without it, detection would rest on a version
+byte plus a length that ordinary framed data could imitate, and a false accept
+would mean silently truncating a payload.
+
+Two details make the separation hold rather than merely look like it holds.
+The tag travels as an argument of the internal sealer, not inside the caller's
+AAD: format identity and record identity are different things, and sharing one
+channel would let a caller of either format spell out the other's marker.
+And the tag and the AAD are bound into one **fixed-width** 32-byte value,
+`SHA-256(len(tag) || tag || aad)`, appended to the header:
+
+```text
+additional data = header(37) || SHA-256(len(tag) || tag || aad)   [32 bytes]
+```
+
+A concatenation would not do. The caller owns `aad` and therefore owns its
+leading bytes, so any prefix one format prepends is a prefix the other
+format's caller can type out, and the two would present identical additional
+data to the AEAD. Collapsing the pair to a digest means imitating another
+format's binding requires a SHA-256 collision, and writing the tag length in
+first means a tag and an AAD can never trade bytes across their own boundary.
 
 The price is diagnosis: a plain stream opened as padded fails with
 `ErrStreamAuth`, the same as a wrong key. To tell those apart, retry with
 `OpenStream` over a fresh reader, which succeeds only in the unpadded case. It
 also shifts what `ErrNoPaddingFrame` means: no longer "sealed before padding
-existed", but "padded in a format newer than this reader". The tag deliberately
-carries no version, and `paddingVersion` stays inside the authenticated
-plaintext, which is where a future opener will dispatch on it.
+existed", but "padded in a format newer than this reader". The tag carries its
+own version, frozen like the HKDF labels; `paddingVersion` stays inside the
+authenticated plaintext, which is where a future opener will dispatch on it.
 
 | Situation | Error |
 | --- | --- |
@@ -514,7 +533,7 @@ opaque names (`RandomHex`) and keep the mapping in a sealed column.
 | sub-key | one per **item** | one per **stream**, shared by all chunks |
 | nonce | 24 random bytes, stored in the blob | derived per chunk: 15-byte stored prefix + counter + flag |
 | tags | 1 | one per chunk |
-| AEAD additional data | `header(18) \|\| callerAAD` | `header(37) \|\| callerAAD`, identical for every chunk |
+| AEAD additional data | `header(18) \|\| callerAAD` (`authData`) | `header(37) \|\| SHA-256(len(tag) \|\| tag \|\| callerAAD)` (`streamAuthData`), identical for every chunk |
 | overhead | 58 bytes | `37 + 16 * chunks` |
 | memory | whole item | one chunk |
 | output | `[]byte`, or base64 for the string/int64 helpers | raw bytes to an `io.Writer` (no base64) |
@@ -572,7 +591,7 @@ All generic on purpose, so an HTTP layer can return them without leaking detail.
 - `Default() *Scheme`: `New(Config{})`, the zero-config path.
 - `randomBytes(n)`: n bytes from `crypto/rand`, the one randomness source in the package.
 - `buildHeader(salt)`: `version || saltLen || salt`. Rejects a salt outside 1..255 so the length byte cannot overflow.
-- `authData(header, aad)`: `header || aad`, the AEAD additional data. A nil or empty aad authenticates the header alone, with no copy made.
+- `authData(header, aad)`: `header || aad`, the AEAD additional data of the **single-shot** format. A nil or empty aad authenticates the header alone, with no copy made. Unambiguous because the header states its own length in `saltLen`; the streaming format cannot rely on that and uses `streamAuthData` instead.
 - `unpackEnvelope(blob)`: split into header, salt and ciphertext (all aliasing `blob`). Rejects a wrong version byte, a zero salt length, or a blob too short to hold nonce plus tag.
 
 ## keys.go
@@ -641,7 +660,7 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 
 - `StreamWriter`: buffers one chunk (`buf`, cap `chunkSize+TagSize` so sealing happens in place) and holds the AEAD, the authenticated `aad`, the nonce prefix, the chunk counter, a `next[1]byte` look-ahead field and a sticky `err`.
 - `(*Scheme) SealWriter(masterKey, dst)` → `SealWriterAAD(..., nil)`.
-- `(*Scheme) SealWriterAAD(masterKey, dst, aad)`: once per stream, salt plus nonce prefix, `buildStreamHeader`, `streamAEAD`, `authData`, then write the header to `dst`. The ciphertext is only complete after `Close`.
+- `(*Scheme) SealWriterAAD(masterKey, dst, aad)`: once per stream, salt plus nonce prefix, `buildStreamHeader`, `streamAEAD`, `streamAuthData`, then write the header to `dst`. The ciphertext is only complete after `Close`. It is `sealWriter` under `plainStreamTag`; the padded sealer is the same call under `paddedStreamTag`.
 - `(*StreamWriter) Write(p)`: buffer `p`, sealing a full buffer as a non-final chunk when more data follows. The trailing chunk is always held back for `Close`.
 - `(*StreamWriter) ReadFrom(r)`: the `io.Copy` fast path. `io.ReadFull` straight into `buf`, then a one-byte look-ahead so a full buffer is only sealed as non-final if something actually follows.
 - `(*StreamWriter) Close()`: seals the remainder as the final chunk and wipes `buf`. Idempotent, and it does not close `dst`. Call it only after the whole input went in, otherwise the result is a valid stream of truncated data.
@@ -653,7 +672,7 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 
 - `StreamReader`: the mirror image. One ciphertext chunk decrypted in place, `plain` aliasing the decrypted part not yet handed out, a `carry[1]byte` look-ahead field, counter, `final`, and a sticky `err` (`io.EOF` on a clean end).
 - `(*Scheme) OpenReader(masterKey, src)` → `OpenReaderAAD(..., nil)`.
-- `(*Scheme) OpenReaderAAD(masterKey, src, aad)`: read and validate the header up front (short input gives `ErrBadStream`), rebuild the same AEAD and `authData`, and size `buf` from the header's chunk size.
+- `(*Scheme) OpenReaderAAD(masterKey, src, aad)`: read and validate the header up front (short input gives `ErrBadStream`), rebuild the same AEAD and `streamAuthData`, and size `buf` from the header's chunk size. It is `openReader` under `plainStreamTag`. Nothing is authenticated yet at this point: the header carries no tag of its own, so a wrong key or AAD is only reported once the first chunk is read.
 - `(*StreamReader) Read(p)`: serve from `plain`, decrypting the next chunk when it runs out. A stream that ends without an authentic final chunk fails with `ErrStreamAuth`, not a clean EOF.
 - `(*StreamReader) WriteTo(dst)`: the `io.Copy` fast path, draining a whole chunk at a time.
 - `(*StreamReader) readChunk()`: carry byte plus `io.ReadFull` → one-byte look-ahead decides `final` → `streamNonce` → `aead.Open(buf[:0], ...)` in place. Any failure is `ErrStreamAuth`.
@@ -691,7 +710,7 @@ numbers.
 - `ErrNotPadded`: the umbrella for a stream that authenticates as padded and
   then cannot be read as one. Match it to catch the class, the two sentinels
   under it to tell which case. An ordinary `SealFile` stream never gets this
-  far: the domain-separated AAD stops it at `ErrStreamAuth`.
+  far: the format tag in the additional data stops it at `ErrStreamAuth`.
 - `ErrNoPaddingFrame`: authenticated, but the plaintext carries no frame, so
   the padded format is newer than this reader.
 - `ErrPaddingMalformed`: a frame was read and the stream then contradicted it,

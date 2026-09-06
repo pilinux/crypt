@@ -678,3 +678,48 @@ func TestStreamAllocationsPerChunk(t *testing.T) {
 		t.Errorf("open allocations grow with the stream: %.0f for 1 chunk, %.0f for 100", oneOpen, manyOpen)
 	}
 }
+
+// TestStreamAuthDataIsUnambiguous pins the properties that keep the two stream
+// formats apart: the binding is fixed width whatever the AAD, it depends on
+// the tag, and no tag/AAD pair can borrow bytes across its own boundary. The
+// cross-format consequence is in TestPaddedTagCannotBeForgedThroughAAD.
+func TestStreamAuthDataIsUnambiguous(t *testing.T) {
+	header := bytes.Repeat([]byte{0xAA}, streamHeaderSize)
+
+	t.Run("fixedWidth", func(t *testing.T) {
+		for _, aad := range [][]byte{nil, {}, []byte("id"), bytes.Repeat([]byte("x"), 4096)} {
+			got := streamAuthData(header, plainStreamTag, aad)
+			if len(got) != streamHeaderSize+32 {
+				t.Errorf("len = %d for a %d-byte aad, want %d", len(got), len(aad), streamHeaderSize+32)
+			}
+			if !bytes.Equal(got[:streamHeaderSize], header) {
+				t.Error("the header is not carried through verbatim")
+			}
+		}
+	})
+
+	t.Run("nilAndEmptyAgree", func(t *testing.T) {
+		if !bytes.Equal(streamAuthData(header, plainStreamTag, nil), streamAuthData(header, plainStreamTag, []byte{})) {
+			t.Error("nil and empty aad differ")
+		}
+	})
+
+	t.Run("tagChangesTheBinding", func(t *testing.T) {
+		if bytes.Equal(streamAuthData(header, plainStreamTag, nil), streamAuthData(header, paddedStreamTag, nil)) {
+			t.Error("the two format tags produce the same binding")
+		}
+		if plainStreamTag == paddedStreamTag {
+			t.Error("the format tags must stay distinct")
+		}
+	})
+
+	// The tag length is hashed in first, so a longer tag cannot be made to
+	// look like a shorter one whose aad starts with the difference.
+	t.Run("noBytesTradeAcrossTheBoundary", func(t *testing.T) {
+		a := streamAuthData(header, "ab", []byte("cd"))
+		b := streamAuthData(header, "abc", []byte("d"))
+		if bytes.Equal(a, b) {
+			t.Error("(tag, aad) pairs that concatenate alike produce the same binding")
+		}
+	})
+}

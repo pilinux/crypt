@@ -27,6 +27,7 @@ package envelope
 
 import (
 	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -71,6 +72,59 @@ const (
 	// version(1) || saltLen(1) || salt || chunkSize(4) || noncePrefix.
 	streamHeaderSize = envelopeHeaderSize + SaltSize + streamChunkSizeWidth + streamNoncePrefixSize
 )
+
+// Stream format tags. Every stream authenticates one of these, hashed together
+// with the caller's AAD by streamAuthData, which is what keeps the two formats
+// apart while their bytes on disk stay identical: neither reader accepts the
+// other's stream, and a sealed file still does not advertise whether it is
+// padded.
+//
+// Two rules hold them up, and both live in streamAuthData rather than here.
+// The tags must stay distinct, since that is the whole separation. And the
+// binding must stay a fixed-width digest of (tag, aad) rather than a
+// concatenation: a caller who supplies the AAD also picks its leading bytes,
+// so a prefix one format prepends is a prefix the other format's caller can
+// type out. Fixed width removes the question entirely.
+//
+// Changing either string re-derives different additional data and orphans
+// already-sealed streams, exactly like the HKDF labels.
+const (
+	// plainStreamTag marks an ordinary SealStream/SealWriter stream.
+	plainStreamTag = "pilinux/crypt/envelope:stream:v1"
+
+	// paddedStreamTag marks a length-padded stream (see padding.go).
+	paddedStreamTag = "pilinux/crypt/envelope:padded:v1"
+)
+
+// streamAuthData returns the byte string authenticated (but not encrypted)
+// with every chunk: the cleartext header, followed by a fixed 32-byte binding
+// of the stream's format tag and the caller's AAD.
+//
+// The binding is a digest and not a concatenation, and that is the point. The
+// caller owns aad, so any prefix a format prepends can be reproduced by a
+// caller of the other format simply by putting those bytes at the front of its
+// own AAD; the two formats would then present identical additional data to the
+// AEAD and each would open the other's streams. Hashing collapses the pair to
+// one fixed-width value, so imitating another format's binding means finding a
+// SHA-256 collision rather than typing a prefix. The tag length is written in
+// first, so a tag and an AAD can never trade bytes across their boundary
+// either.
+//
+// The digest is computed, never stored: nothing on disk changes and no file
+// says which format it is.
+func streamAuthData(header []byte, tag string, aad []byte) []byte {
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(tag)))
+
+	h := sha256.New()
+	h.Write(n[:])
+	h.Write([]byte(tag))
+	h.Write(aad)
+
+	out := make([]byte, 0, len(header)+sha256.Size)
+	out = append(out, header...)
+	return h.Sum(out)
+}
 
 // Errors returned by the streaming API. Like the rest of the package they are
 // deliberately generic and never say which chunk failed or why.
@@ -206,6 +260,13 @@ func (s *Scheme) SealWriter(masterKey []byte, dst io.Writer) (*StreamWriter, err
 // input went in successfully, otherwise the result is a valid stream of
 // truncated data.
 func (s *Scheme) SealWriterAAD(masterKey []byte, dst io.Writer, aad []byte) (*StreamWriter, error) {
+	return s.sealWriter(masterKey, dst, plainStreamTag, aad)
+}
+
+// sealWriter is [Scheme.SealWriterAAD] over a chosen format tag, which the
+// padded sealer needs and no caller may supply: the tag identifies the format
+// and the aad identifies the record, so the two must not share a channel.
+func (s *Scheme) sealWriter(masterKey []byte, dst io.Writer, tag string, aad []byte) (*StreamWriter, error) {
 	chunkSize := s.chunkSize
 	if chunkSize < MinChunkSize || chunkSize > MaxChunkSize {
 		return nil, ErrInvalidChunkSize
@@ -235,7 +296,7 @@ func (s *Scheme) SealWriterAAD(masterKey []byte, dst io.Writer, aad []byte) (*St
 	return &StreamWriter{
 		dst:    dst,
 		aead:   aead,
-		aad:    authData(header, aad),
+		aad:    streamAuthData(header, tag, aad),
 		prefix: prefix,
 		buf:    make([]byte, chunkSize, chunkSize+TagSize),
 	}, nil
@@ -385,6 +446,12 @@ func (s *Scheme) OpenReader(masterKey []byte, src io.Reader) (*StreamReader, err
 // front, including the chunk size, which is taken from the stream and not
 // from the [Scheme]: changing Config.ChunkSize never orphans sealed data.
 func (s *Scheme) OpenReaderAAD(masterKey []byte, src io.Reader, aad []byte) (*StreamReader, error) {
+	return s.openReader(masterKey, src, plainStreamTag, aad)
+}
+
+// openReader is [Scheme.OpenReaderAAD] over a chosen format tag; see
+// [Scheme.sealWriter] for why the tag is not part of the caller's AAD.
+func (s *Scheme) openReader(masterKey []byte, src io.Reader, tag string, aad []byte) (*StreamReader, error) {
 	header := make([]byte, streamHeaderSize)
 	if _, err := io.ReadFull(src, header); err != nil {
 		// too short to be a stream; anything else is the caller's I/O error
@@ -407,7 +474,7 @@ func (s *Scheme) OpenReaderAAD(masterKey []byte, src io.Reader, aad []byte) (*St
 	return &StreamReader{
 		src:    src,
 		aead:   aead,
-		aad:    authData(header, aad),
+		aad:    streamAuthData(header, tag, aad),
 		prefix: prefix,
 		buf:    make([]byte, chunkSize+TagSize),
 	}, nil
@@ -532,7 +599,13 @@ func (s *Scheme) SealStream(masterKey []byte, dst io.Writer, src io.Reader) (int
 // stream is abandoned without a final chunk, so a partial dst can never be
 // opened as a complete one.
 func (s *Scheme) SealStreamAAD(masterKey []byte, dst io.Writer, src io.Reader, aad []byte) (int64, error) {
-	w, err := s.SealWriterAAD(masterKey, dst, aad)
+	return s.sealStream(masterKey, dst, src, plainStreamTag, aad)
+}
+
+// sealStream is [Scheme.SealStreamAAD] over a chosen format tag; see
+// [Scheme.sealWriter] for why the tag is not part of the caller's AAD.
+func (s *Scheme) sealStream(masterKey []byte, dst io.Writer, src io.Reader, tag string, aad []byte) (int64, error) {
+	w, err := s.sealWriter(masterKey, dst, tag, aad)
 	if err != nil {
 		return 0, err
 	}

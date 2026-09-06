@@ -58,25 +58,24 @@ const (
 	// spin a core. The bound and io.ErrNoProgress come from bufio, so a reader
 	// the rest of Go tolerates is tolerated here.
 	maxConsecutiveEmptyReads = 100
-
-	// paddedAADTag keeps padded and plain streams apart. Only the padded sealer
-	// and opener prepend it to the caller's AAD, so neither reader can open the
-	// other's stream; it is never written, so both formats share the same header
-	// and a file still does not advertise whether it is padded.
-	//
-	// The tag carries no version on purpose: paddingVersion sits inside the
-	// authenticated plaintext, so a future padded format still authenticates
-	// here and can be dispatched on that byte.
-	paddedAADTag = "pilinux/crypt/envelope:padded"
 )
 
-// paddedAAD prefixes aad with the padded-format domain tag. The tag is a
-// fixed-length constant, so the concatenation is unambiguous.
-func paddedAAD(aad []byte) []byte {
-	out := make([]byte, 0, len(paddedAADTag)+len(aad))
-	out = append(out, paddedAADTag...)
-	return append(out, aad...)
-}
+// The padded format is kept apart from the plain one by paddedStreamTag, which
+// every chunk authenticates through streamAuthData (see stream.go). Neither
+// reader accepts the other's stream, and because the tag is hashed rather than
+// stored, both formats still write the identical header and a file does not
+// advertise whether it is padded.
+//
+// The tag reaches the AEAD as a parameter of the unexported sealStream and
+// openReader, not through the caller's aad. That is deliberate: aad belongs to
+// the caller, so anything smuggled into it is something the caller of the other
+// format can type out, and the separation would hold only for callers who
+// happened not to. Format identity and record identity are different things and
+// travel in different arguments.
+//
+// The tag carries a version because it is frozen the way the HKDF labels are;
+// the padded format's own version byte is paddingVersion, inside the
+// authenticated plaintext, which is what a future format would dispatch on.
 
 // Errors returned by the padded helpers. The two umbrellas, ErrNotPadded and
 // ErrSourceSize, carry no cause of their own so the sentinels wrapping them
@@ -407,7 +406,7 @@ func (s *Scheme) SealPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Rea
 		io.LimitReader(zeroReader{}, target-paddingFrameSize-size),
 	)
 
-	n, err := s.SealStreamAAD(masterKey, dst, padded, paddedAAD(aad))
+	n, err := s.sealStream(masterKey, dst, padded, paddedStreamTag, aad)
 	if err != nil {
 		return n, err
 	}
@@ -470,7 +469,7 @@ func (s *Scheme) OpenPaddedReader(masterKey []byte, src io.Reader) (*PaddedReade
 // fails here with [ErrStreamAuth], indistinguishable from a wrong key. Retry
 // with [Scheme.OpenReaderAAD] over a fresh reader to tell those apart.
 func (s *Scheme) OpenPaddedReaderAAD(masterKey []byte, src io.Reader, aad []byte) (*PaddedReader, error) {
-	r, err := s.OpenReaderAAD(masterKey, src, paddedAAD(aad))
+	r, err := s.openReader(masterKey, src, paddedStreamTag, aad)
 	if err != nil {
 		return nil, err
 	}

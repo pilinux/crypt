@@ -309,8 +309,8 @@ func TestOpenPaddedFileDetectsPaddingTruncation(t *testing.T) {
 func sealAsPadded(t *testing.T, s *Scheme, masterKey, plain, aad []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if _, err := s.SealStreamAAD(masterKey, &buf, bytes.NewReader(plain), paddedAAD(aad)); err != nil {
-		t.Fatalf("SealStreamAAD error: %v", err)
+	if _, err := s.sealStream(masterKey, &buf, bytes.NewReader(plain), paddedStreamTag, aad); err != nil {
+		t.Fatalf("sealStream error: %v", err)
 	}
 	return buf.Bytes()
 }
@@ -1254,9 +1254,9 @@ func TestPaddedPlaintextLayout(t *testing.T) {
 		t.Errorf("first byte = %#x, want the ordinary streamVersion %#x", blob[0], streamVersion)
 	}
 
-	r, err := s.OpenReaderAAD(masterKey, bytes.NewReader(blob), paddedAAD(nil))
+	r, err := s.openReader(masterKey, bytes.NewReader(blob), paddedStreamTag, nil)
 	if err != nil {
-		t.Fatalf("OpenReaderAAD error: %v", err)
+		t.Fatalf("openReader error: %v", err)
 	}
 	plain, err := io.ReadAll(r)
 	if err != nil {
@@ -1908,5 +1908,87 @@ func TestPaddedReaderIsSpentAfterACleanEnd(t *testing.T) {
 	}
 	if err := r.Close(); err != nil {
 		t.Errorf("Close after the end = %v, want nil", err)
+	}
+}
+
+// TestPaddedTagCannotBeForgedThroughAAD is the regression test for the way the
+// padded and plain formats used to be separated. The tag was prepended to the
+// caller's AAD, so a caller of the plain API could reproduce it by putting the
+// same bytes at the front of its own AAD, and the padded reader then accepted a
+// plain stream: format confusion under a valid tag, with the frame parsed out
+// of somebody's plaintext.
+//
+// The tag is now a parameter of the unexported sealStream/openReader and is
+// hashed to a fixed width, so no aad value reaches the same binding.
+func TestPaddedTagCannotBeForgedThroughAAD(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	inner := []byte("row:1")
+
+	// a plaintext that would parse as a padding frame for a 4-byte payload
+	var frame [paddingFrameSize]byte
+	frame[0] = paddingVersion
+	binary.BigEndian.PutUint64(frame[1:], 4)
+	plain := append(frame[:], "AAAA"...)
+	plain = append(plain, make([]byte, PaddedSize(4)-int64(len(plain)))...)
+
+	// every shape of caller AAD that used to collide, plus the digest itself
+	digest := streamAuthData(nil, paddedStreamTag, inner)
+	for _, name := range []string{"tagThenAAD", "tagAlone", "bindingDigest"} {
+		aad := digest
+		switch name {
+		case "tagThenAAD":
+			aad = append([]byte(paddedStreamTag), inner...)
+		case "tagAlone":
+			aad = []byte(paddedStreamTag)
+		}
+
+		t.Run(name, func(t *testing.T) {
+			var sealed bytes.Buffer
+			if _, err := s.SealStreamAAD(masterKey, &sealed, bytes.NewReader(plain), aad); err != nil {
+				t.Fatalf("SealStreamAAD error: %v", err)
+			}
+
+			for _, probe := range [][]byte{inner, aad, nil} {
+				_, err := s.OpenPaddedStreamAAD(masterKey, io.Discard, bytes.NewReader(sealed.Bytes()), probe)
+				if !errors.Is(err, ErrStreamAuth) {
+					t.Errorf("padded reader accepted a plain stream (aad %q): err = %v, want ErrStreamAuth", probe, err)
+				}
+			}
+
+			// and the plain reader still opens it, so the AAD itself is intact
+			if _, err := s.OpenStreamAAD(masterKey, io.Discard, bytes.NewReader(sealed.Bytes()), aad); err != nil {
+				t.Errorf("plain round-trip broke: %v", err)
+			}
+		})
+	}
+}
+
+// TestPaddedStreamIgnoresTagShapedAAD is the other direction: a padded stream
+// sealed under an AAD that looks like the tag is not openable by the plain
+// reader either, whatever it is handed.
+func TestPaddedStreamIgnoresTagShapedAAD(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, 300)
+	aad := []byte(paddedStreamTag)
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStreamAAD(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload)), aad); err != nil {
+		t.Fatalf("SealPaddedStreamAAD error: %v", err)
+	}
+
+	for _, probe := range [][]byte{aad, append([]byte(paddedStreamTag), aad...), nil} {
+		if _, err := s.OpenStreamAAD(masterKey, io.Discard, bytes.NewReader(sealed.Bytes()), probe); !errors.Is(err, ErrStreamAuth) {
+			t.Errorf("plain reader accepted a padded stream (aad %q): err = %v, want ErrStreamAuth", probe, err)
+		}
+	}
+
+	var out bytes.Buffer
+	if _, err := s.OpenPaddedStreamAAD(masterKey, &out, bytes.NewReader(sealed.Bytes()), aad); err != nil {
+		t.Fatalf("padded round-trip broke: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Error("payload did not survive the round trip")
 	}
 }

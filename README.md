@@ -281,6 +281,10 @@ Which objects still owe a pass is the one thing this does not tell you for
 free: padded and plain blobs are deliberately indistinguishable, so an unpadded
 object opened as padded fails with `ErrStreamAuth`, exactly like a wrong key.
 Retry with `OpenStream` to identify it, or track the state alongside the object.
+The two formats are told apart by a format tag that every chunk authenticates
+and no file stores, bound to the caller's AAD as one fixed-width digest, so
+neither reader can be talked into accepting the other's stream whatever AAD it
+is handed.
 
 Only the length is hidden. File names, timestamps and access patterns leak
 independently; use `RandomHex` names if that matters.
