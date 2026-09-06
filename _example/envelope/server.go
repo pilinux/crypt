@@ -426,8 +426,23 @@ func (s *store) download(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = src.Close() }()
 
+	// A padded object states its own length: the frame is authenticated with
+	// the first chunk, so the pull form knows Size before any body is written
+	// and Content-Length need not come from the store at all. Opening here also
+	// means a bad blob is a clean 500 rather than a truncated 200.
+	length := o.Plain
+	var padded *envelope.PaddedReader
+	if o.Padded {
+		padded, err = s.scheme.OpenPaddedReaderAAD(s.masterKey, src, s.aad(id))
+		if err != nil {
+			http.Error(w, "opening stored object: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		length = padded.Size()
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprint(o.Plain))
+	w.Header().Set("Content-Length", fmt.Sprint(length))
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+template.URLQueryEscaper(o.Name))
 	w.Header().Set("X-Plaintext-Sha256", o.Digest)
 
@@ -435,13 +450,13 @@ func (s *store) download(w http.ResponseWriter, r *http.Request) {
 	// response cannot be recalled once sent. A file destination would be
 	// removed on error; here the only honest signal is to cut the connection,
 	// which a wrong Content-Length already does.
-	if o.Padded {
-		_, err = s.scheme.OpenPaddedStreamAAD(s.masterKey, w, src, s.aad(id))
+	if padded != nil {
+		_, err = padded.WriteTo(w)
 	} else {
 		_, err = s.scheme.OpenStreamAAD(s.masterKey, w, src, s.aad(id))
 	}
 	if err != nil {
-		log.Printf("download %s failed after %d bytes: %v", id, o.Plain, err)
+		log.Printf("download %s failed after %d bytes: %v", id, length, err)
 	}
 }
 

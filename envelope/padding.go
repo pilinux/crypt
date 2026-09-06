@@ -117,6 +117,12 @@ var (
 	ErrSourceShort = fmt.Errorf("%w: source ended before the declared size", ErrSourceSize)
 	ErrSourceLong  = fmt.Errorf("%w: source holds more data than the declared size (one byte consumed)", ErrSourceSize)
 
+	// ErrIncompleteRead means a [PaddedReader] was closed before its payload
+	// had been read, so the padding was never drained and nothing about the
+	// end of the stream is known. It says what did not happen rather than what
+	// is wrong with the stream.
+	ErrIncompleteRead = errors.New("envelope: padded reader closed before its payload was read")
+
 	// errBadReadCount: the source returned a count outside 0..len(p).
 	errBadReadCount = errors.New("envelope: source returned an invalid read count")
 
@@ -419,6 +425,247 @@ func (s *Scheme) SealPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Rea
 	return size, nil
 }
 
+// PaddedReader reads the payload out of a stream sealed by
+// [Scheme.SealPaddedStreamAAD] and throws the padding away. Reach for it when
+// you would rather pull the payload yourself than have
+// [Scheme.OpenPaddedStreamAAD] push it into an [io.Writer]: an HTTP handler,
+// say, can set Content-Length from [PaddedReader.Size] before writing any body.
+//
+// Watch the ending. The payload runs out before the stream does, and the
+// padding behind it still has to be authenticated, so what you have read is
+// not trustworthy until you reach the end. Reading to [io.EOF], or getting a
+// nil error from [PaddedReader.WriteTo], takes you there. Reading Size bytes
+// and stopping leaves you one call short, and [PaddedReader.Close] is what runs
+// the check for you.
+//
+// Errors are sticky: the first one ends the reader, whether it came from the
+// stream or from a writer that stopped accepting bytes. A PaddedReader is not
+// safe for concurrent use.
+type PaddedReader struct {
+	r    *StreamReader // the plain stream whose plaintext carries the frame
+	size int64         // payload length from the frame, already authenticated
+	left int64         // payload bytes not yet handed out
+	pad  int64         // padding bytes still to drain, per PaddedSize
+	err  error         // sticky: the first failure, or io.EOF after a clean end
+}
+
+// OpenPaddedReader returns a [PaddedReader] over src. It is shorthand for
+// [Scheme.OpenPaddedReaderAAD] with a nil AAD.
+func (s *Scheme) OpenPaddedReader(masterKey []byte, src io.Reader) (*PaddedReader, error) {
+	return s.OpenPaddedReaderAAD(masterKey, src, nil)
+}
+
+// OpenPaddedReaderAAD returns a [PaddedReader] over src, verifying aad. The
+// stream header and the padding frame are both read and checked here, so a
+// stream that is not a readable padded one is reported before any payload byte
+// is handed out, and [PaddedReader.Size] is known from the start.
+//
+// The frame sits inside the first chunk, so the length it states has been
+// authenticated by the time this returns. That is not a promise the rest of the
+// stream matches it: a truncated body still fails later with
+// [ErrPaddingMalformed].
+//
+// Like [Scheme.OpenPaddedStreamAAD] this never accepts a plain
+// [Scheme.SealStream] blob, since the AAD domain-separates the two formats; one
+// fails here with [ErrStreamAuth], indistinguishable from a wrong key. Retry
+// with [Scheme.OpenReaderAAD] over a fresh reader to tell those apart.
+func (s *Scheme) OpenPaddedReaderAAD(masterKey []byte, src io.Reader, aad []byte) (*PaddedReader, error) {
+	r, err := s.OpenReaderAAD(masterKey, src, paddedAAD(aad))
+	if err != nil {
+		return nil, err
+	}
+
+	var frame [paddingFrameSize]byte
+	if _, err := io.ReadFull(r, frame[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, ErrNoPaddingFrame
+		}
+		return nil, err
+	}
+	if frame[0] != paddingVersion {
+		return nil, ErrNoPaddingFrame
+	}
+	size := binary.BigEndian.Uint64(frame[1:])
+	if size > math.MaxInt64 {
+		return nil, ErrPaddingMalformed
+	}
+	n := int64(size) // #nosec G115 -- bounded above
+
+	// How much padding the sealer must have written. Knowing it up front is
+	// what lets the drain be bounded rather than open-ended: everything read is
+	// authenticated, so a hostile blob is not a forgery risk, but a frame
+	// claiming a small payload inside a huge stream should not be able to make
+	// the reader chew through all of it before complaining. want is at least
+	// size+paddingFrameSize because padme never contracts, so the subtraction
+	// cannot go negative.
+	want := PaddedSize(n)
+	if want == 0 {
+		return nil, ErrPaddingMalformed
+	}
+
+	return &PaddedReader{r: r, size: n, left: n, pad: want - paddingFrameSize - n}, nil
+}
+
+// Size is the payload length taken from the stream's authenticated frame, known
+// before any payload byte is read. It is the plaintext length the padding hides
+// from anyone looking at the file, so a handler can set Content-Length from it.
+//
+// The frame is authentic, but the stream behind it can still be truncated, so a
+// response sized from Size may yet end early with [ErrPaddingMalformed].
+func (r *PaddedReader) Size() int64 { return r.size }
+
+// Read hands out the payload and never the padding. It returns [io.EOF] only
+// once exactly the padding [PaddedSize] calls for has been drained and the
+// stream has ended there, so a clean EOF means the whole stream authenticated.
+func (r *PaddedReader) Read(p []byte) (int, error) {
+	// Checked ahead of the zero-length case on purpose, as in exactReader: a
+	// finished reader answers every call alike. Do not reorder.
+	if r.err != nil {
+		return 0, r.err
+	}
+	if len(p) == 0 {
+		// Must not reach finish, which would end the reader on a call that
+		// asked for nothing.
+		return 0, nil
+	}
+	if r.left == 0 {
+		if err := r.finish(); err != nil {
+			r.fail(err)
+			return 0, r.err
+		}
+		r.fail(io.EOF)
+		return 0, r.err
+	}
+
+	if int64(len(p)) > r.left {
+		p = p[:r.left]
+	}
+	n, err := r.r.Read(p)
+	r.left -= int64(n)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// the frame claims more payload than the stream holds
+			r.fail(ErrPaddingMalformed)
+		} else {
+			r.fail(err)
+		}
+		return n, r.err
+	}
+	return n, nil
+}
+
+// WriteTo drains the payload into dst, which is what [io.Copy] picks up, and
+// then authenticates the padding. It returns the number of payload bytes
+// written, so a nil error means dst holds the whole payload and the stream
+// ended cleanly behind it.
+//
+// Chunks reach dst as they authenticate, so treat dst as provisional until this
+// returns nil: a stream truncated inside its padding leaves a complete payload
+// there alongside an error.
+func (r *PaddedReader) WriteTo(dst io.Writer) (int64, error) {
+	if r.err != nil {
+		if errors.Is(r.err, io.EOF) {
+			return 0, nil
+		}
+		return 0, r.err
+	}
+
+	written, err := io.CopyN(dst, r.r, r.left)
+	r.left -= written
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// the frame claims more payload than the stream holds
+			r.fail(ErrPaddingMalformed)
+		} else {
+			// A failing dst ends the reader too. The padding behind an
+			// unfinished copy cannot be authenticated without reading a payload
+			// nobody wants, and reporting what stopped the copy is more use
+			// than reporting that it stopped.
+			r.fail(err)
+		}
+		return written, r.err
+	}
+	if err := r.finish(); err != nil {
+		r.fail(err)
+		return written, r.err
+	}
+	r.fail(io.EOF)
+	return written, nil
+}
+
+// Close ends the reader and reports whether what it produced was authentic: nil
+// means the payload was complete and the padding behind it authenticated. It
+// reads at most the padding, never closes the underlying source, and repeats
+// its verdict if called again.
+//
+// A caller that reads to [io.EOF] does not need it. Close is for the caller
+// that reads [PaddedReader.Size] bytes and stops, which lands exactly one call
+// short of the padding check, and is the pattern Size invites.
+//
+// Closing with payload still unread returns [ErrIncompleteRead]. Authenticating
+// the tail would mean reading through everything skipped, and this package does
+// not drain an unbounded amount behind the caller's back; a reader being
+// abandoned holds no resources, so it can simply be dropped instead.
+func (r *PaddedReader) Close() error {
+	switch {
+	case r.err != nil:
+		if errors.Is(r.err, io.EOF) {
+			return nil
+		}
+		return r.err
+	case r.left > 0:
+		r.fail(ErrIncompleteRead)
+		return r.err
+	}
+
+	if err := r.finish(); err != nil {
+		r.fail(err)
+		return r.err
+	}
+	r.fail(io.EOF)
+	return nil
+}
+
+// finish drains exactly the padding the frame calls for and requires the stream
+// to end there. Draining is not optional: the padding fills whole trailing
+// chunks, and only reading them authenticates those chunks and the final-chunk
+// flag, so stopping at the payload would accept a stream truncated inside its
+// padding.
+func (r *PaddedReader) finish() error {
+	if _, err := io.CopyN(io.Discard, r.r, r.pad); err != nil {
+		if errors.Is(err, io.EOF) {
+			return ErrPaddingMalformed
+		}
+		return err
+	}
+	r.pad = 0
+
+	// The padding ended where PaddedSize says it should, so the stream must end
+	// here too. This read is also what authenticates the final-chunk flag when
+	// the padding lands on a chunk boundary.
+	var probe [1]byte
+	switch n, err := io.ReadFull(r.r, probe[:]); {
+	case n > 0:
+		return ErrPaddingMalformed
+	case errors.Is(err, io.EOF):
+		return nil
+	default:
+		return err
+	}
+}
+
+// fail records the terminal state, so every later call answers identically.
+// io.EOF is recorded too, which is what makes a clean end idempotent. The
+// stream underneath is ended at the same time, which wipes the plaintext chunk
+// it is still holding. Only the first call counts: the error that ended the
+// reader is the one worth reporting.
+func (r *PaddedReader) fail(err error) {
+	if r.err == nil {
+		r.err = err
+		r.r.fail(err)
+	}
+}
+
 // OpenPaddedStream opens a padded stream from src into dst, discarding the
 // padding. It is shorthand for [Scheme.OpenPaddedStreamAAD] with a nil AAD.
 func (s *Scheme) OpenPaddedStream(masterKey []byte, dst io.Writer, src io.Reader) (int64, error) {
@@ -427,8 +674,9 @@ func (s *Scheme) OpenPaddedStream(masterKey []byte, dst io.Writer, src io.Reader
 
 // OpenPaddedStreamAAD opens a stream sealed by [Scheme.SealPaddedStreamAAD]
 // into dst, verifying aad, and returns the number of payload bytes written. It
-// reads the frame, copies out exactly that many bytes, then drains exactly the
-// padding [PaddedSize] calls for and requires the stream to end there.
+// is [Scheme.OpenPaddedReaderAAD] driven to the end: read the frame, copy out
+// exactly the payload it declares, then drain exactly the padding [PaddedSize]
+// calls for and require the stream to end there.
 //
 // Padded and plain streams are domain-separated by AAD, so neither reader can
 // be fooled into accepting the other's data, and the two still share a
@@ -442,70 +690,14 @@ func (s *Scheme) OpenPaddedStream(masterKey []byte, dst io.Writer, src io.Reader
 // read, but a stream truncated inside its padding leaves dst holding a complete
 // payload alongside a non-nil error. Treat dst as provisional until this
 // returns nil.
+//
+// Reach for [Scheme.OpenPaddedReaderAAD] instead when the payload length is
+// wanted before the body is written, or when the destination pulls rather than
+// being pushed to.
 func (s *Scheme) OpenPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Reader, aad []byte) (int64, error) {
-	r, err := s.OpenReaderAAD(masterKey, src, paddedAAD(aad))
+	r, err := s.OpenPaddedReaderAAD(masterKey, src, aad)
 	if err != nil {
 		return 0, err
 	}
-
-	var frame [paddingFrameSize]byte
-	if _, err := io.ReadFull(r, frame[:]); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return 0, ErrNoPaddingFrame
-		}
-		return 0, err
-	}
-	if frame[0] != paddingVersion {
-		return 0, ErrNoPaddingFrame
-	}
-	size := binary.BigEndian.Uint64(frame[1:])
-	if size > math.MaxInt64 {
-		return 0, ErrPaddingMalformed
-	}
-
-	written, err := io.CopyN(dst, r, int64(size)) // #nosec G115 -- bounded above
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			// the frame claims more payload than the stream holds
-			return written, ErrPaddingMalformed
-		}
-		return written, err
-	}
-
-	// How much padding the sealer must have written. Knowing it up front is
-	// what lets the drain below be bounded rather than open-ended: everything
-	// read is authenticated, so a hostile blob is not a forgery risk, but a
-	// frame claiming a small payload inside a huge stream should not be able to
-	// make the reader chew through all of it before complaining. want is at
-	// least size+paddingFrameSize because padme never contracts, so the
-	// subtraction cannot go negative.
-	want := PaddedSize(int64(size)) // #nosec G115 -- bounded above
-	if want == 0 {
-		return written, ErrPaddingMalformed
-	}
-	expect := want - paddingFrameSize - int64(size)
-
-	// Draining is not optional: the padding fills whole trailing chunks, and
-	// only reading to the end authenticates them and the final-chunk flag.
-	// Stopping at the payload would accept a stream truncated inside its
-	// padding.
-	if _, err := io.CopyN(io.Discard, r, expect); err != nil {
-		if errors.Is(err, io.EOF) {
-			return written, ErrPaddingMalformed
-		}
-		return written, err
-	}
-
-	// The padding ended where PaddedSize says it should, so the stream must end
-	// here too. This read is also what authenticates the final-chunk flag when
-	// the padding lands on a chunk boundary.
-	var probe [1]byte
-	switch n, err := io.ReadFull(r, probe[:]); {
-	case n > 0:
-		return written, ErrPaddingMalformed
-	case errors.Is(err, io.EOF):
-		return written, nil
-	default:
-		return written, err
-	}
+	return r.WriteTo(dst)
 }

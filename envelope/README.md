@@ -455,6 +455,25 @@ inside its padding leaves a complete payload next to a non-nil error.
 `OpenPaddedFile` removes the partial destination for you, which is the reason
 to prefer it when the destination is a file.
 
+**The payload can be pulled instead of pushed.** `OpenPaddedReader` (and
+`OpenPaddedReaderAAD`) returns a `PaddedReader`: an `io.ReadCloser` over the
+payload alone, whose `Size` reports the payload length from the authenticated
+frame before a byte of body is handed out. That is what an HTTP handler needs to
+set `Content-Length` without recording the plaintext length beside the blob, and
+what anything consuming an `io.Reader` needs. `OpenPaddedStream` is that reader
+driven to its end, so there is one implementation of the frame and the drain.
+
+It is the one reader here whose payload ends before its stream does, which is
+what `Close` is for. `Read` and `WriteTo` report the end of the payload only
+once the padding behind it has authenticated, so reading to `io.EOF` needs
+nothing further. A caller that asks for exactly `Size` bytes stops one call
+short of that check, and `Close` is where it then happens: `nil` means the
+payload was complete and the padding behind it intact. Closing with payload
+still unread reports `ErrIncompleteRead` instead of draining however much was
+skipped to reach the tail, since this package does not read an unbounded amount
+behind the caller's back; a reader being abandoned holds nothing, so it can just
+be dropped.
+
 **The two formats are domain-separated by AAD.** Both padded helpers prepend a
 fixed `paddedAADTag` to the caller's AAD. It is never stored, so a padded file
 and a plain one are byte-identical in shape and the header still does not
@@ -478,6 +497,7 @@ plaintext, which is where a future opener will dispatch on it.
 | a frame was read and the stream then contradicted it: too little payload, or a padding length `PaddedSize` would not have produced | `ErrPaddingMalformed` (wraps `ErrNotPadded`) |
 | source is not a regular file, changed size while being sealed, or did not deliver the declared `size` (caught at the payload boundary, before any padding is written) | `ErrSourceIrregular`, `ErrSourceShort` or `ErrSourceLong`, all matching `ErrSourceSize` |
 | padding chunks removed, reordered or altered | `ErrStreamAuth`, thanks to the drain |
+| a `PaddedReader` closed before its payload had been read | `ErrIncompleteRead`, which says only that the padding was never checked |
 
 Padding hides the length and nothing else. The file name, the directory, the
 mtime and the access pattern all leak independently, and a name like
@@ -687,6 +707,10 @@ numbers.
   size. Both wrap `ErrSourceSize`, so `errors.Is` against that still matches
   either, while a caller that must tell "retry the upload" from "reject it" can
   branch on the specific one.
+- `ErrIncompleteRead`: a `PaddedReader` was closed with payload still unread,
+  so the padding was never drained. It says what did not happen rather than what
+  is wrong, so it sits under neither umbrella: the bytes already read are as
+  authentic as the chunks that carried them.
 - `PaddedSize(n)`: the padded plaintext length for an n-byte payload, `padme(9 + n)`.
   Exported so callers can budget storage; returns 0 for a negative or
   unrepresentable n.
@@ -743,11 +767,32 @@ numbers.
   frame that lies about the payload. Returns the real payload length, not the
   padded one. Nothing beyond one chunk is buffered, so an in-memory blob, an
   HTTP body or a pipe is padded and sealed on the fly.
+- `PaddedReader`: the pull form, an `io.ReadCloser` plus `io.WriterTo` over the
+  payload. Holds the `StreamReader`, the framed `size`, the payload `left`, the
+  `pad` still to drain and a sticky `err` (`io.EOF` on a clean end). No buffers
+  of its own.
+- `(*Scheme) OpenPaddedReader(masterKey, src)` → `OpenPaddedReaderAAD(..., nil)`.
+- `(*Scheme) OpenPaddedReaderAAD(masterKey, src, aad)`: `OpenReaderAAD` with the
+  padded AAD → read and check the frame up front, so a stream that is not a
+  readable padded one is reported before any payload byte is handed out.
+- `(*PaddedReader) Size()`: the framed payload length, authenticated with the
+  first chunk and known before the body. A truncated body still fails later.
+- `(*PaddedReader) Read(p)` / `WriteTo(dst)`: payload only, reporting the end
+  of the stream only once the padding behind it has drained and authenticated.
+  A zero-length read is answered `(0, nil)` without ending the reader, as in
+  `exactReader`.
+- `(*PaddedReader) Close()`: the verdict for a caller that stopped after `Size`
+  bytes, which is one call short of the padding check. `ErrIncompleteRead` if
+  payload is still unread; it never closes the source and repeats itself.
+- `(*PaddedReader) finish()` / `fail(err)`: the bounded drain plus end probe,
+  and the sticky terminal state, which also ends the `StreamReader` underneath
+  so the chunk it holds is wiped.
 - `(*Scheme) OpenPaddedStream(masterKey, dst, src)` → `OpenPaddedStreamAAD(..., nil)`.
-- `(*Scheme) OpenPaddedStreamAAD(masterKey, dst, src, aad)`: `OpenReaderAAD` →
-  read the frame → `io.CopyN` the payload → **drain the rest**. The drain
-  authenticates the padding-only trailing chunks and the final-chunk flag;
-  without it a stream truncated inside its padding would pass.
+- `(*Scheme) OpenPaddedStreamAAD(masterKey, dst, src, aad)`:
+  `OpenPaddedReaderAAD` → `WriteTo`, the same shape `OpenStreamAAD` has over
+  `OpenReaderAAD`. The drain inside authenticates the padding-only trailing
+  chunks and the final-chunk flag; without it a stream truncated inside its
+  padding would pass.
 - `(*Scheme) SealPaddedFile(masterKey, dstPath, srcPath)` → `SealPaddedFileAAD(..., nil)`.
 - `(*Scheme) SealPaddedFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` →
   `Stat` the open handle → `SealPaddedStreamAAD`.

@@ -1420,3 +1420,493 @@ func TestOpenPaddedStreamBoundsTheDrain(t *testing.T) {
 	}
 	t.Logf("read %d of %d sealed bytes before rejecting", src.n, len(sealed))
 }
+
+// The padded reader is the pull form of OpenPaddedStream, so it has to be
+// usable everywhere an io.Reader is: io.Copy takes the WriteTo path, and an
+// HTTP layer that closes what it reads takes the ReadCloser one.
+var (
+	_ io.ReadCloser = (*PaddedReader)(nil)
+	_ io.WriterTo   = (*PaddedReader)(nil)
+)
+
+func TestOpenPaddedReaderRoundTrip(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	for _, tt := range streamSizes {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := randomData(t, tt.n)
+			var sealed bytes.Buffer
+			if _, err := s.SealPaddedStream(masterKey, &sealed, bytes.NewReader(payload), int64(tt.n)); err != nil {
+				t.Fatalf("SealPaddedStream error: %v", err)
+			}
+
+			r, err := s.OpenPaddedReader(masterKey, &sealed)
+			if err != nil {
+				t.Fatalf("OpenPaddedReader error: %v", err)
+			}
+			if r.Size() != int64(tt.n) {
+				t.Errorf("Size = %d, want %d", r.Size(), tt.n)
+			}
+
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("ReadAll error: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Error("round-tripped payload differs")
+			}
+			// reading to EOF already authenticated the padding, so Close only
+			// repeats the verdict, however often it is asked
+			for i := range 2 {
+				if err := r.Close(); err != nil {
+					t.Errorf("Close %d after a clean read: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
+// TestPaddedReaderSizeIsKnownBeforeTheBody is the reason the pull form exists:
+// the payload length comes out of the authenticated frame before a byte of
+// payload is handed over, so a handler can set Content-Length from it instead
+// of recording the length beside the blob.
+func TestPaddedReaderSizeIsKnownBeforeTheBody(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+	aad := []byte("obj:42")
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStreamAAD(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload)), aad); err != nil {
+		t.Fatalf("SealPaddedStreamAAD error: %v", err)
+	}
+
+	src := &countingSource{r: bytes.NewReader(sealed.Bytes())}
+	r, err := s.OpenPaddedReaderAAD(masterKey, src, aad)
+	if err != nil {
+		t.Fatalf("OpenPaddedReaderAAD error: %v", err)
+	}
+	if r.Size() != int64(len(payload)) {
+		t.Fatalf("Size = %d, want %d", r.Size(), len(payload))
+	}
+	// the frame rides in the first chunk, so the length is known after one
+	// chunk rather than after the whole stream
+	if limit := int64(streamHeaderSize + 2*(testChunkSize+TagSize)); src.n > limit {
+		t.Errorf("read %d bytes to learn the size, want <= %d", src.n, limit)
+	}
+
+	// and the size is authentic: the wrong aad never gets that far
+	if _, err := s.OpenPaddedReaderAAD(masterKey, bytes.NewReader(sealed.Bytes()), []byte("obj:7")); !errors.Is(err, ErrStreamAuth) {
+		t.Errorf("wrong aad: err = %v, want ErrStreamAuth", err)
+	}
+}
+
+// TestPaddedReaderCloseCatchesBadPadding is why Close exists. Size invites the
+// caller to ask for exactly that many bytes, which stops one call short of the
+// padding check, so without Close a stream whose padding contradicts
+// PaddedSize would be read as good.
+func TestPaddedReaderCloseCatchesBadPadding(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	const payloadSize = 4096
+	payload := randomData(t, payloadSize)
+
+	frame := make([]byte, paddingFrameSize)
+	frame[0] = paddingVersion
+	binary.BigEndian.PutUint64(frame[1:], payloadSize)
+	correct := PaddedSize(payloadSize) - paddingFrameSize - payloadSize
+
+	build := func(t *testing.T, padding int64) []byte {
+		t.Helper()
+		plain := append(append([]byte{}, frame...), payload...)
+		plain = append(plain, make([]byte, padding)...)
+		return sealAsPadded(t, s, masterKey, plain, nil)
+	}
+
+	tests := []struct {
+		name    string
+		padding int64
+		wantErr bool
+	}{
+		{name: "exact", padding: correct},
+		{name: "oneShort", padding: correct - 1, wantErr: true},
+		{name: "oneLong", padding: correct + 1, wantErr: true},
+		{name: "none", padding: 0, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := s.OpenPaddedReader(masterKey, bytes.NewReader(build(t, tt.padding)))
+			if err != nil {
+				t.Fatalf("OpenPaddedReader error: %v", err)
+			}
+
+			// the Content-Length pattern: ask for Size bytes and stop
+			got := make([]byte, r.Size())
+			if _, err := io.ReadFull(r, got); err != nil {
+				t.Fatalf("ReadFull error: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Error("payload differs")
+			}
+
+			err = r.Close()
+			if tt.wantErr && !errors.Is(err, ErrPaddingMalformed) {
+				t.Errorf("Close = %v, want ErrPaddingMalformed", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Close = %v, want nil", err)
+			}
+			// and the verdict does not change on a second ask
+			if again := r.Close(); !errors.Is(again, err) {
+				t.Errorf("second Close = %v, want %v", again, err)
+			}
+		})
+	}
+}
+
+// TestPaddedReaderCloseEarlyIsIncomplete pins what closing without reading the
+// payload does: it says so, rather than quietly draining however many gigabytes
+// were skipped in order to reach the padding.
+func TestPaddedReaderCloseEarlyIsIncomplete(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStream(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("SealPaddedStream error: %v", err)
+	}
+
+	src := &countingSource{r: bytes.NewReader(sealed.Bytes())}
+	r, err := s.OpenPaddedReader(masterKey, src)
+	if err != nil {
+		t.Fatalf("OpenPaddedReader error: %v", err)
+	}
+	if _, err := io.ReadFull(r, make([]byte, 1)); err != nil {
+		t.Fatalf("Read error: %v", err)
+	}
+
+	if err := r.Close(); !errors.Is(err, ErrIncompleteRead) {
+		t.Errorf("Close = %v, want ErrIncompleteRead", err)
+	}
+	// nothing was drained to find that out
+	if limit := int64(streamHeaderSize + 2*(testChunkSize+TagSize)); src.n > limit {
+		t.Errorf("Close read on to %d bytes of a %d byte stream, want <= %d", src.n, sealed.Len(), limit)
+	}
+	// it stands outside both format umbrellas: the stream may be perfectly good
+	if errors.Is(err, ErrNotPadded) || errors.Is(err, ErrSourceSize) {
+		t.Errorf("err = %v, want it to blame neither the format nor a source", err)
+	}
+	// and it is terminal, so a later read cannot resume behind Close's back
+	if _, err := r.Read(make([]byte, 8)); !errors.Is(err, ErrIncompleteRead) {
+		t.Errorf("Read after Close = %v, want ErrIncompleteRead", err)
+	}
+	if err := r.Close(); !errors.Is(err, ErrIncompleteRead) {
+		t.Errorf("second Close = %v, want ErrIncompleteRead", err)
+	}
+}
+
+func TestOpenPaddedReaderRejectsBadStreams(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	// not a stream at all: the header check fails before any padded reasoning
+	if _, err := s.OpenPaddedReader(masterKey, bytes.NewReader([]byte("too short"))); !errors.Is(err, ErrBadStream) {
+		t.Errorf("short input: err = %v, want ErrBadStream", err)
+	}
+
+	// a plain stream: stopped by the domain-separated AAD, as with the push form
+	var plain bytes.Buffer
+	if _, err := s.SealStream(masterKey, &plain, bytes.NewReader(randomData(t, 2048))); err != nil {
+		t.Fatalf("SealStream error: %v", err)
+	}
+	if _, err := s.OpenPaddedReader(masterKey, bytes.NewReader(plain.Bytes())); !errors.Is(err, ErrStreamAuth) {
+		t.Errorf("plain stream: err = %v, want ErrStreamAuth", err)
+	}
+
+	// authenticates as padded, but carries no frame
+	noFrame := sealAsPadded(t, s, masterKey, notAFrame(t, 512), nil)
+	if _, err := s.OpenPaddedReader(masterKey, bytes.NewReader(noFrame)); !errors.Is(err, ErrNoPaddingFrame) {
+		t.Errorf("no frame: err = %v, want ErrNoPaddingFrame", err)
+	}
+
+	// too short to hold a frame at all
+	short := sealAsPadded(t, s, masterKey, []byte{paddingVersion, 0, 0}, nil)
+	if _, err := s.OpenPaddedReader(masterKey, bytes.NewReader(short)); !errors.Is(err, ErrNoPaddingFrame) {
+		t.Errorf("truncated frame: err = %v, want ErrNoPaddingFrame", err)
+	}
+
+	// a declared length that does not fit in an int64, rejected on the guard
+	huge := make([]byte, paddingFrameSize)
+	huge[0] = paddingVersion
+	binary.BigEndian.PutUint64(huge[1:], math.MaxUint64)
+	if _, err := s.OpenPaddedReader(masterKey, bytes.NewReader(sealAsPadded(t, s, masterKey, huge, nil))); !errors.Is(err, ErrPaddingMalformed) {
+		t.Errorf("oversized length: err = %v, want ErrPaddingMalformed", err)
+	}
+}
+
+func TestPaddedReaderErrorsAreSticky(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	// a frame promising a megabyte the stream does not hold
+	frame := make([]byte, paddingFrameSize)
+	frame[0] = paddingVersion
+	binary.BigEndian.PutUint64(frame[1:], 1<<20)
+	r, err := s.OpenPaddedReader(masterKey, bytes.NewReader(sealAsPadded(t, s, masterKey, frame, nil)))
+	if err != nil {
+		t.Fatalf("OpenPaddedReader error: %v", err)
+	}
+
+	_, first := r.Read(make([]byte, 64))
+	if !errors.Is(first, ErrPaddingMalformed) {
+		t.Fatalf("err = %v, want ErrPaddingMalformed", first)
+	}
+	for i := range 3 {
+		if _, err := r.Read(make([]byte, 64)); err != first {
+			t.Errorf("retry %d: err = %v, want the identical sticky error", i, err)
+		}
+	}
+	if _, err := r.WriteTo(io.Discard); err != first {
+		t.Errorf("WriteTo after the failure: err = %v, want the identical sticky error", err)
+	}
+	if err := r.Close(); err != first {
+		t.Errorf("Close after the failure: err = %v, want the identical sticky error", err)
+	}
+}
+
+func TestPaddedReaderZeroLengthReadIsNoOp(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, 512)
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStream(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("SealPaddedStream error: %v", err)
+	}
+	r, err := s.OpenPaddedReader(masterKey, &sealed)
+	if err != nil {
+		t.Fatalf("OpenPaddedReader error: %v", err)
+	}
+
+	if n, err := r.Read(nil); n != 0 || err != nil {
+		t.Errorf("Read(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+	got := make([]byte, r.Size())
+	if _, err := io.ReadFull(r, got); err != nil {
+		t.Fatalf("ReadFull error: %v", err)
+	}
+	// the payload is spent, but a read of nothing must not stand in for the
+	// drain that ends the stream
+	if n, err := r.Read([]byte{}); n != 0 || err != nil {
+		t.Errorf("Read(empty) at the payload end = (%d, %v), want (0, nil)", n, err)
+	}
+	if n, err := r.Read(make([]byte, 8)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("Read at the payload end = (%d, %v), want (0, io.EOF)", n, err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Error("round-tripped payload differs")
+	}
+}
+
+// TestPaddedReaderMixedReadAndWriteTo covers the shape a handler ends up with:
+// peek at the head of the payload, then hand the rest to io.Copy.
+func TestPaddedReaderMixedReadAndWriteTo(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStream(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("SealPaddedStream error: %v", err)
+	}
+	r, err := s.OpenPaddedReader(masterKey, &sealed)
+	if err != nil {
+		t.Fatalf("OpenPaddedReader error: %v", err)
+	}
+
+	head := make([]byte, 300)
+	if _, err := io.ReadFull(r, head); err != nil {
+		t.Fatalf("ReadFull error: %v", err)
+	}
+	var rest bytes.Buffer
+	n, err := r.WriteTo(&rest)
+	if err != nil {
+		t.Fatalf("WriteTo error: %v", err)
+	}
+	if want := int64(len(payload) - len(head)); n != want {
+		t.Errorf("WriteTo = %d, want the remaining %d", n, want)
+	}
+	if !bytes.Equal(append(head, rest.Bytes()...), payload) {
+		t.Error("payload differs after a mixed read")
+	}
+	if err := r.Close(); err != nil {
+		t.Errorf("Close after a complete read: %v", err)
+	}
+}
+
+// failingSource hands out its data and then fails instead of reporting EOF,
+// the way a network source dies mid-stream. It is the only way to reach the
+// paths where the reader passes an I/O error through rather than translating
+// it into a format error.
+type failingSource struct {
+	data []byte
+	off  int
+	err  error
+}
+
+func (f *failingSource) Read(p []byte) (int, error) {
+	if f.off >= len(f.data) {
+		return 0, f.err
+	}
+	n := copy(p, f.data[f.off:])
+	f.off += n
+	return n, nil
+}
+
+// sealPaddedBlob seals payload with padding and returns the blob, the chunk
+// count and the plaintext offset where the padding starts, so a test can aim a
+// bit flip at the payload or at the padding.
+func sealPaddedBlob(t *testing.T, s *Scheme, masterKey, payload []byte) []byte {
+	t.Helper()
+	var sealed bytes.Buffer
+	if _, err := s.SealPaddedStream(masterKey, &sealed, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("SealPaddedStream error: %v", err)
+	}
+	return sealed.Bytes()
+}
+
+// chunkOffset is where chunk i starts in a sealed stream.
+func chunkOffset(i int) int { return streamHeaderSize + i*(testChunkSize+TagSize) }
+
+// TestPaddedReaderSurfacesStreamFailures covers the two places a chunk can fail
+// to authenticate once the frame has been read: under the payload, and under
+// the padding, where only the drain is looking.
+func TestPaddedReaderSurfacesStreamFailures(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+	blob := sealPaddedBlob(t, s, masterKey, payload)
+
+	// the padding starts inside this chunk, so the last one is padding only
+	padStart := int(paddedTestSize+paddingFrameSize) / testChunkSize
+	lastChunk := (len(blob) - streamHeaderSize) / (testChunkSize + TagSize)
+	if padStart >= lastChunk {
+		t.Fatalf("padding starts in chunk %d of %d, need a padding-only chunk", padStart, lastChunk)
+	}
+
+	tamper := func(chunk int) []byte {
+		cut := append([]byte{}, blob...)
+		cut[chunkOffset(chunk)+10] ^= 0xFF
+		return cut
+	}
+
+	tests := []struct {
+		name  string
+		chunk int
+	}{
+		{name: "underThePayload", chunk: 1},
+		{name: "underThePadding", chunk: lastChunk - 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// through Read, which is where a pulling caller meets it
+			r, err := s.OpenPaddedReader(masterKey, bytes.NewReader(tamper(tt.chunk)))
+			if err != nil {
+				t.Fatalf("OpenPaddedReader error: %v", err)
+			}
+			_, err = io.Copy(io.Discard, struct{ io.Reader }{r}) // hide WriteTo
+			if !errors.Is(err, ErrStreamAuth) {
+				t.Errorf("Read: err = %v, want ErrStreamAuth", err)
+			}
+			if closeErr := r.Close(); !errors.Is(closeErr, ErrStreamAuth) {
+				t.Errorf("Close: err = %v, want the sticky ErrStreamAuth", closeErr)
+			}
+
+			// and through WriteTo, the io.Copy fast path
+			r, err = s.OpenPaddedReader(masterKey, bytes.NewReader(tamper(tt.chunk)))
+			if err != nil {
+				t.Fatalf("OpenPaddedReader error: %v", err)
+			}
+			if _, err := r.WriteTo(io.Discard); !errors.Is(err, ErrStreamAuth) {
+				t.Errorf("WriteTo: err = %v, want ErrStreamAuth", err)
+			}
+		})
+	}
+}
+
+// TestPaddedReaderPassesSourceErrorsThrough pins that an I/O failure stays
+// itself instead of being reported as a malformed stream: the frame read on the
+// way in, and the drain on the way out.
+func TestPaddedReaderPassesSourceErrorsThrough(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+	blob := sealPaddedBlob(t, s, masterKey, payload)
+	sentinel := errors.New("disk fell over")
+
+	// dies while the constructor is reading the frame out of chunk 0
+	_, err := s.OpenPaddedReader(masterKey, &failingSource{data: blob[:streamHeaderSize+10], err: sentinel})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("frame read: err = %v, want the source error", err)
+	}
+	if errors.Is(err, ErrNotPadded) {
+		t.Errorf("err = %v, want an I/O failure, not a format verdict", err)
+	}
+
+	// dies at the very end, where only the drain and the end probe are looking
+	r, err := s.OpenPaddedReader(masterKey, &failingSource{data: blob, err: sentinel})
+	if err != nil {
+		t.Fatalf("OpenPaddedReader error: %v", err)
+	}
+	if _, err := r.WriteTo(io.Discard); !errors.Is(err, sentinel) {
+		t.Errorf("drain: err = %v, want the source error", err)
+	}
+}
+
+// TestPaddedReaderRejectsUnpaddableLength covers the frame whose length is a
+// legal int64 that PaddedSize still cannot frame, which is the guard between
+// the MaxUint64 check and the subtraction that computes the padding.
+func TestPaddedReaderRejectsUnpaddableLength(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	frame := make([]byte, paddingFrameSize)
+	frame[0] = paddingVersion
+	binary.BigEndian.PutUint64(frame[1:], math.MaxInt64)
+	_, err := s.OpenPaddedReader(masterKey, bytes.NewReader(sealAsPadded(t, s, masterKey, frame, nil)))
+	if !errors.Is(err, ErrPaddingMalformed) {
+		t.Errorf("err = %v, want ErrPaddingMalformed", err)
+	}
+}
+
+func TestPaddedReaderIsSpentAfterACleanEnd(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, 2048)
+
+	r, err := s.OpenPaddedReader(masterKey, bytes.NewReader(sealPaddedBlob(t, s, masterKey, payload)))
+	if err != nil {
+		t.Fatalf("OpenPaddedReader error: %v", err)
+	}
+	var out bytes.Buffer
+	if _, err := r.WriteTo(&out); err != nil {
+		t.Fatalf("WriteTo error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Error("round-tripped payload differs")
+	}
+
+	// a spent reader is empty, not broken: nothing is left to hand out, and the
+	// stream behind it already authenticated
+	if n, err := r.WriteTo(&out); n != 0 || err != nil {
+		t.Errorf("WriteTo after the end = (%d, %v), want (0, nil)", n, err)
+	}
+	if n, err := r.Read(make([]byte, 8)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("Read after the end = (%d, %v), want (0, io.EOF)", n, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Errorf("Close after the end = %v, want nil", err)
+	}
+}
