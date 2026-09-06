@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 )
 
 // testChunkSize keeps the multi-chunk tests cheap: the smallest chunk the
@@ -723,3 +724,207 @@ func TestStreamAuthDataIsUnambiguous(t *testing.T) {
 		}
 	})
 }
+
+// failingReader delivers n bytes and then fails, the shape of a network source
+// that dies part-way through an upload.
+type failingReader struct {
+	left int
+	err  error
+}
+
+func (f *failingReader) Read(p []byte) (int, error) {
+	if f.left <= 0 {
+		return 0, f.err
+	}
+	if len(p) > f.left {
+		p = p[:f.left]
+	}
+	for i := range p {
+		p[i] = 'S'
+	}
+	f.left -= len(p)
+	return len(p), nil
+}
+
+// TestStreamWriterCloseRefusesAfterSourceFailure is the regression test for the
+// footgun `defer w.Close()` used to be. ReadFrom leaving its error unsticky
+// meant a failed io.Copy followed by the reflexive deferred Close produced a
+// perfectly valid stream holding a prefix of the file, indistinguishable from a
+// complete one. The error is sticky now, so Close reports it and writes no
+// final chunk.
+func TestStreamWriterCloseRefusesAfterSourceFailure(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	errSource := errors.New("network died")
+
+	var sealed bytes.Buffer
+	w, err := s.SealWriter(masterKey, &sealed)
+	if err != nil {
+		t.Fatalf("SealWriter error: %v", err)
+	}
+
+	src := &failingReader{left: 2 * testChunkSize, err: errSource}
+	if _, err := io.Copy(w, src); !errors.Is(err, errSource) {
+		t.Fatalf("io.Copy: err = %v, want the source error", err)
+	}
+
+	// the idiomatic deferred Close, which used to finalize the fragment
+	if err := w.Close(); !errors.Is(err, errSource) {
+		t.Errorf("Close: err = %v, want the sticky source error", err)
+	}
+	// and again, since Close repeats its verdict
+	if err := w.Close(); !errors.Is(err, errSource) {
+		t.Errorf("second Close: err = %v, want the same error", err)
+	}
+
+	// what reached dst must not open as a complete stream
+	if _, err := s.OpenStream(masterKey, io.Discard, bytes.NewReader(sealed.Bytes())); !errors.Is(err, ErrStreamAuth) {
+		t.Errorf("the abandoned fragment opened: err = %v, want ErrStreamAuth", err)
+	}
+
+	// and the writer is spent
+	if _, err := w.Write([]byte("more")); !errors.Is(err, errSource) {
+		t.Errorf("Write after failure: err = %v, want the sticky error", err)
+	}
+}
+
+// TestStreamWriterAbort covers the case no sticky error can catch: nothing went
+// wrong with the stream, the caller simply decided not to keep it.
+func TestStreamWriterAbort(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	t.Run("discardsAGoodStream", func(t *testing.T) {
+		var sealed bytes.Buffer
+		w, err := s.SealWriter(masterKey, &sealed)
+		if err != nil {
+			t.Fatalf("SealWriter error: %v", err)
+		}
+		if _, err := w.Write(randomData(t, 3*testChunkSize)); err != nil {
+			t.Fatalf("Write error: %v", err)
+		}
+
+		w.Abort()
+
+		if err := w.Close(); !errors.Is(err, ErrStreamAborted) {
+			t.Errorf("Close after Abort: err = %v, want ErrStreamAborted", err)
+		}
+		if _, err := w.Write([]byte("x")); !errors.Is(err, ErrStreamAborted) {
+			t.Errorf("Write after Abort: err = %v, want ErrStreamAborted", err)
+		}
+		if _, err := s.OpenStream(masterKey, io.Discard, bytes.NewReader(sealed.Bytes())); !errors.Is(err, ErrStreamAuth) {
+			t.Errorf("an aborted stream opened: err = %v, want ErrStreamAuth", err)
+		}
+	})
+
+	// the documented `defer w.Abort()` shape: it must not undo a good Close
+	t.Run("noOpAfterACleanClose", func(t *testing.T) {
+		payload := randomData(t, testChunkSize+7)
+		var sealed bytes.Buffer
+		w, err := s.SealWriter(masterKey, &sealed)
+		if err != nil {
+			t.Fatalf("SealWriter error: %v", err)
+		}
+		defer w.Abort()
+
+		if _, err := io.Copy(w, bytes.NewReader(payload)); err != nil {
+			t.Fatalf("io.Copy error: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close error: %v", err)
+		}
+
+		w.Abort() // what the defer will do again
+
+		if err := w.Close(); err != nil {
+			t.Errorf("Close after a no-op Abort: err = %v, want nil", err)
+		}
+		var out bytes.Buffer
+		if _, err := s.OpenStream(masterKey, &out, bytes.NewReader(sealed.Bytes())); err != nil {
+			t.Fatalf("OpenStream error: %v", err)
+		}
+		if !bytes.Equal(out.Bytes(), payload) {
+			t.Error("payload did not survive a stream that was closed then aborted")
+		}
+	})
+
+	// an earlier failure is the more useful verdict, so Abort must not mask it
+	t.Run("keepsAnEarlierError", func(t *testing.T) {
+		// the header write succeeds, the first chunk does not
+		w, err := s.SealWriter(masterKey, &failWriterAfter{ok: 1})
+		if err != nil {
+			t.Fatalf("SealWriter error: %v", err)
+		}
+		if _, err := w.Write(randomData(t, 2*testChunkSize)); !errors.Is(err, errWriteFailed) {
+			t.Fatalf("Write: err = %v, want the destination error", err)
+		}
+		w.Abort()
+		if err := w.Close(); !errors.Is(err, errWriteFailed) {
+			t.Errorf("Close: err = %v, want the destination error, not ErrStreamAborted", err)
+		}
+	})
+}
+
+// failWriterAfter accepts ok writes and fails from then on.
+type failWriterAfter struct{ ok int }
+
+func (f *failWriterAfter) Write(p []byte) (int, error) {
+	if f.ok > 0 {
+		f.ok--
+		return len(p), nil
+	}
+	return 0, errWriteFailed
+}
+
+// TestStreamReaderWriteToRejectsBadWriters is the regression test for the
+// missing io.Copy guards. A destination reporting more than it was given used
+// to panic on the reslice, and one reporting (0, nil) forever used to spin.
+func TestStreamReaderWriteToRejectsBadWriters(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	sealed, _ := seal(t, s, masterKey, 2*testChunkSize, nil)
+
+	tests := []struct {
+		name string
+		dst  io.Writer
+		want error
+	}{
+		{name: "overCounting", dst: badWriter{n: func(l int) int { return l + 1 }}, want: errBadWriteCount},
+		{name: "negativeCount", dst: badWriter{n: func(int) int { return -1 }}, want: errBadWriteCount},
+		{name: "shortWithNoError", dst: badWriter{n: func(l int) int { return l / 2 }}, want: io.ErrShortWrite},
+		{name: "neverProgresses", dst: badWriter{n: func(int) int { return 0 }}, want: io.ErrShortWrite},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := s.OpenReader(masterKey, bytes.NewReader(sealed))
+			if err != nil {
+				t.Fatalf("OpenReader error: %v", err)
+			}
+
+			// a panic or a hang here is the bug; the test binary's own timeout
+			// catches the hang, and the guards make both an ordinary error
+			done := make(chan error, 1)
+			go func() { _, e := r.WriteTo(tt.dst); done <- e }()
+
+			select {
+			case err := <-done:
+				if !errors.Is(err, tt.want) {
+					t.Errorf("WriteTo: err = %v, want %v", err, tt.want)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("WriteTo did not return: it is spinning on a writer that never progresses")
+			}
+
+			// the failure is terminal, so no plaintext leaks out afterwards
+			if _, err := io.ReadAll(struct{ io.Reader }{r}); !errors.Is(err, tt.want) {
+				t.Errorf("Read after the bad write: err = %v, want the sticky %v", err, tt.want)
+			}
+		})
+	}
+}
+
+// badWriter reports whatever n says, which is how a writer breaks the
+// io.Writer contract without returning an error.
+type badWriter struct{ n func(size int) int }
+
+func (b badWriter) Write(p []byte) (int, error) { return b.n(len(p)), nil }

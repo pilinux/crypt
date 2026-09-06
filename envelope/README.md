@@ -647,7 +647,8 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `ErrInvalidChunkSize`: chunk size (from `Config` or from a header) outside `MinChunkSize`..`MaxChunkSize`.
 - `ErrBadStream`: bad header, or a chunk too short to hold a tag.
 - `ErrStreamAuth`: chunk failed authentication. Wrong key or aad, modified data, or chunks reordered, duplicated, dropped or truncated.
-- `ErrStreamClosed`: `Write` after `Close`.
+- `ErrStreamClosed`: `Write` after a clean `Close`. A writer that failed or was aborted reports what ended it instead.
+- `ErrStreamAborted`: `Close` or a write method after `Abort` discarded the stream. It says the fragment on `dst` was abandoned on purpose, not that anything went wrong with it.
 
 ### Header and nonce helpers
 
@@ -663,10 +664,11 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `(*Scheme) SealWriterAAD(masterKey, dst, aad)`: once per stream, salt plus nonce prefix, `buildStreamHeader`, `streamAEAD`, `streamAuthData`, then write the header to `dst`. The ciphertext is only complete after `Close`. It is `sealWriter` under `plainStreamTag`; the padded sealer is the same call under `paddedStreamTag`.
 - `(*StreamWriter) Write(p)`: buffer `p`, sealing a full buffer as a non-final chunk when more data follows. The trailing chunk is always held back for `Close`.
 - `(*StreamWriter) ReadFrom(r)`: the `io.Copy` fast path. `io.ReadFull` straight into `buf`, then a one-byte look-ahead so a full buffer is only sealed as non-final if something actually follows.
-- `(*StreamWriter) Close()`: seals the remainder as the final chunk and wipes `buf`. Idempotent, and it does not close `dst`. Call it only after the whole input went in, otherwise the result is a valid stream of truncated data.
+- `(*StreamWriter) Close()`: seals the remainder as the final chunk and wipes `buf`. Idempotent, and it does not close `dst`. It finalizes only a stream that has not failed: a chunk that could not be written, a source that quit part-way, or an `Abort` is sticky and `Close` returns that error without emitting a final chunk, so `defer w.Close()` cannot turn an interrupted transfer into a valid short stream.
 - `(*StreamWriter) state()`: sticky error first, then `ErrStreamClosed`.
 - `(*StreamWriter) seal(final)`: `streamNonce` → `aead.Seal(buf[:0], ...)` in place → write → bump counter. A write failure is sticky, so a half-written stream can never be finalized.
-- `(*StreamWriter) abort()`: mark closed and wipe, without emitting a final chunk, so a partial stream stays unopenable.
+- `(*StreamWriter) Abort()`: discard the stream without finalizing it: mark closed, wipe `buf`, and record `ErrStreamAborted` so every later call reports it. For the case no sticky error can catch, where nothing went wrong and the caller simply decided not to keep the stream. A no-op once `Close` has succeeded, so `defer w.Abort()` alongside an explicit `w.Close()` is the safe shape.
+- `(*StreamWriter) fail(err)`: record the terminal state, first error wins.
 
 ### StreamReader
 
@@ -674,14 +676,14 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `(*Scheme) OpenReader(masterKey, src)` → `OpenReaderAAD(..., nil)`.
 - `(*Scheme) OpenReaderAAD(masterKey, src, aad)`: read and validate the header up front (short input gives `ErrBadStream`), rebuild the same AEAD and `streamAuthData`, and size `buf` from the header's chunk size. It is `openReader` under `plainStreamTag`. Nothing is authenticated yet at this point: the header carries no tag of its own, so a wrong key or AAD is only reported once the first chunk is read.
 - `(*StreamReader) Read(p)`: serve from `plain`, decrypting the next chunk when it runs out. A stream that ends without an authentic final chunk fails with `ErrStreamAuth`, not a clean EOF.
-- `(*StreamReader) WriteTo(dst)`: the `io.Copy` fast path, draining a whole chunk at a time.
+- `(*StreamReader) WriteTo(dst)`: the `io.Copy` fast path, draining a whole chunk at a time. `dst` is caller-supplied, so its reported count is checked the way `io.Copy` checks it: a count outside `0..len(p)` ends the reader, and a short write with no error is `io.ErrShortWrite` rather than another trip round the loop.
 - `(*StreamReader) readChunk()`: carry byte plus `io.ReadFull` → one-byte look-ahead decides `final` → `streamNonce` → `aead.Open(buf[:0], ...)` in place. Any failure is `ErrStreamAuth`.
 - `(*StreamReader) fail(err)`: record the terminal state (`io.EOF` means clean) and wipe the buffer.
 
 ### One-shot stream helpers
 
 - `(*Scheme) SealStream(masterKey, dst, src)` → `SealStreamAAD(..., nil)`.
-- `(*Scheme) SealStreamAAD(masterKey, dst, src, aad)`: `SealWriterAAD` → `ReadFrom` → `Close`, returning the plaintext bytes sealed. On error it calls `abort()`, never `Close`, so a partial `dst` cannot pass as complete.
+- `(*Scheme) SealStreamAAD(masterKey, dst, src, aad)`: `SealWriterAAD` → `ReadFrom` → `Close`, returning the plaintext bytes sealed. On error it calls `Abort()`, never `Close`, so a partial `dst` cannot pass as complete.
 - `(*Scheme) OpenStream(masterKey, dst, src)` → `OpenStreamAAD(..., nil)`.
 - `(*Scheme) OpenStreamAAD(masterKey, dst, src, aad)`: `OpenReaderAAD` → `WriteTo`, returning the plaintext bytes written. Chunks are written as they authenticate, so treat `dst` as unusable unless the call returns nil.
 

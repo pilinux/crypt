@@ -7,11 +7,13 @@ package envelope
 //	  SealStream[AAD]      drives writer -> ReadFrom -> Close
 //	   -> SealWriterAAD     once per stream: GenerateSalt + randomBytes (salt,
 //	                        nonce prefix), buildStreamHeader, streamAEAD
-//	                        (DeriveSubKey -> XChaCha20), authData, header to dst
+//	                        (DeriveSubKey -> XChaCha20), streamAuthData, header
+//	                        to dst
 //	   -> ReadFrom          fills buf; a one-byte look-ahead decides whether a
 //	                        full buffer is a non-final chunk
-//	   -> Close             seals the remainder as the final chunk; on error
-//	                        abort runs instead, so no final chunk is written
+//	   -> Close             seals the remainder as the final chunk, unless the
+//	                        stream already failed; Abort discards it outright,
+//	                        and either way no final chunk is written
 //	  Write / ReadFrom / Close
 //	   -> seal              streamNonce -> aead.Seal(buf[:0]) -> dst.Write
 //
@@ -19,7 +21,7 @@ package envelope
 //	  OpenStream[AAD]      drives reader -> WriteTo
 //	   -> OpenReaderAAD     once per stream: reads and checks the header via
 //	                        parseStreamHeader, streamAEAD (same sub-key),
-//	                        authData
+//	                        streamAuthData
 //	   -> WriteTo           drains the stream a whole chunk at a time
 //	  Read / WriteTo
 //	   -> readChunk         streamNonce -> aead.Open(buf[:0]); fail wipes buf
@@ -144,8 +146,20 @@ var (
 	ErrStreamAuth = errors.New("envelope: stream authentication failed")
 
 	// ErrStreamClosed is returned by [StreamWriter.Write] after the stream has
-	// been closed.
+	// been closed cleanly.
 	ErrStreamClosed = errors.New("envelope: stream writer is closed")
+
+	// ErrStreamAborted is returned by [StreamWriter.Close] and the write
+	// methods after [StreamWriter.Abort] discarded the stream. It says the
+	// destination holds a deliberate fragment, not a failure: nothing is wrong
+	// with the bytes that were written, there just is no final chunk and never
+	// will be.
+	ErrStreamAborted = errors.New("envelope: stream writer was aborted")
+
+	// errBadWriteCount: a destination returned a count outside 0..len(p),
+	// breaking the io.Writer contract. Unexported for the same reason io.Copy
+	// keeps errInvalidWrite unexported: nothing can be done about it but stop.
+	errBadWriteCount = errors.New("envelope: destination returned an invalid write count")
 )
 
 // buildStreamHeader assembles the cleartext stream header. It is authenticated
@@ -240,8 +254,8 @@ type StreamWriter struct {
 	n       int             // bytes buffered
 	next    [1]byte         // ReadFrom look-ahead; a field, so it is not allocated per chunk
 	counter uint64          // big-endian chunk counter in the nonce
-	closed  bool            // true after Close, so a second call is a no-op
-	err     error           // sticky: a failed chunk stops the stream for good
+	closed  bool            // true after Close or Abort, so a second call is a no-op
+	err     error           // sticky: a failed chunk, a failed source or an Abort
 }
 
 // SealWriter returns a [StreamWriter] that seals to dst under a fresh per-
@@ -255,10 +269,14 @@ func (s *Scheme) SealWriter(masterKey []byte, dst io.Writer) (*StreamWriter, err
 // [Scheme.OpenReaderAAD] must be given the identical value.
 //
 // The stream header is written to dst immediately; the ciphertext is only
-// complete once [StreamWriter.Close] has returned without error. Close
-// finalizes whatever has been written so far, so call it only after the whole
-// input went in successfully, otherwise the result is a valid stream of
-// truncated data.
+// complete once [StreamWriter.Close] has returned without error.
+//
+// Close finalizes what has been written, so it completes a stream that has not
+// failed and refuses one that has. A source that quit part-way or a chunk that
+// could not be written is sticky and Close reports it, so `defer w.Close()`
+// cannot silently turn an interrupted transfer into a valid short stream. What
+// it cannot know is a caller that changes its mind about a stream nothing went
+// wrong with; say that with [StreamWriter.Abort].
 func (s *Scheme) SealWriterAAD(masterKey []byte, dst io.Writer, aad []byte) (*StreamWriter, error) {
 	return s.sealWriter(masterKey, dst, plainStreamTag, aad)
 }
@@ -344,7 +362,10 @@ func (w *StreamWriter) ReadFrom(r io.Reader) (int64, error) {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return total, nil
 			}
-			return total, err
+			// r quit part-way, so the stream is missing plaintext it will
+			// never get. Sticky, so Close reports it instead of sealing the
+			// remainder into a valid short stream.
+			return total, w.fail(err)
 		}
 
 		// the buffer is full, but a full buffer is only a non-final chunk if
@@ -354,7 +375,7 @@ func (w *StreamWriter) ReadFrom(r io.Reader) (int64, error) {
 		case errors.Is(err, io.EOF):
 			return total, nil
 		default:
-			return total, err
+			return total, w.fail(err)
 		}
 		total++
 
@@ -366,20 +387,69 @@ func (w *StreamWriter) ReadFrom(r io.Reader) (int64, error) {
 	}
 }
 
-// Close seals the buffered remainder as the final chunk. It does not close
-// the underlying writer. Calling it more than once is a no-op.
+// Close seals the buffered remainder as the final chunk, which is what
+// completes the stream. It does not close the underlying writer, and repeats
+// its verdict if called again.
+//
+// Close finalizes only a stream that has not failed. Once anything has gone
+// wrong, a chunk that could not be written, a source that quit part-way, or an
+// [StreamWriter.Abort], the error is sticky and Close returns it without
+// writing a final chunk: sealing the remainder then would turn a partial
+// stream into a valid short one, which is the failure the final-chunk flag
+// exists to prevent.
+//
+// So `defer w.Close()` is safe on its own for detecting the problem, but it
+// cannot express "I changed my mind about a stream that was going fine". Pair
+// it with `defer w.Abort()` for that; Abort after a successful Close does
+// nothing.
 func (w *StreamWriter) Close() error {
-	if w.err != nil {
+	if w.closed {
+		// whatever finished this stream already decided the verdict
 		return w.err
 	}
-	if w.closed {
-		return nil
+	if w.err != nil {
+		// a failed chunk or a failed source: finish without a final chunk
+		w.closed = true
+		Zero(w.buf)
+		return w.err
 	}
 
 	err := w.seal(true)
 	w.closed = true
 	Zero(w.buf)
 	return err
+}
+
+// Abort discards the stream instead of completing it. No final chunk is
+// written, so what reached the destination can never be opened as a whole
+// stream; the buffered plaintext is wiped and every later call reports
+// [ErrStreamAborted].
+//
+// It is the counterpart of [StreamWriter.Close] for the case where the input
+// turned out to be wrong rather than the stream: a validation that failed
+// after the bytes went in, a request that was cancelled, a caller that simply
+// changed its mind. Abort on a stream that Close already completed does
+// nothing, so the safe shape is both:
+//
+//	w, err := scheme.SealWriter(masterKey, dst)
+//	...
+//	defer w.Abort()               // no-op once Close has succeeded
+//	if _, err := io.Copy(w, src); err != nil {
+//		return err                // Abort discards the fragment
+//	}
+//	return w.Close()              // the only thing that completes the stream
+//
+// Nothing is released by aborting, since a StreamWriter holds no resources and
+// does not own the destination: discarding whatever reached dst is the
+// caller's job.
+func (w *StreamWriter) Abort() {
+	if w.closed {
+		// already finished, cleanly or otherwise; do not rewrite the verdict
+		return
+	}
+	w.closed = true
+	_ = w.fail(ErrStreamAborted)
+	Zero(w.buf)
 }
 
 // state reports whether the stream can still accept data.
@@ -400,8 +470,7 @@ func (w *StreamWriter) seal(final bool) error {
 
 	chunk := w.aead.Seal(w.buf[:0], w.nonce[:], w.buf[:w.n], w.aad)
 	if _, err := w.dst.Write(chunk); err != nil {
-		w.err = err
-		return err
+		return w.fail(err)
 	}
 
 	w.counter++
@@ -409,11 +478,15 @@ func (w *StreamWriter) seal(final bool) error {
 	return nil
 }
 
-// abort wipes the buffer and blocks the stream without writing a final chunk,
-// so an interrupted stream can never be mistaken for a complete one.
-func (w *StreamWriter) abort() {
-	w.closed = true
-	Zero(w.buf)
+// fail records err as the terminal state and returns it, so a later Close
+// reports it instead of sealing the buffered remainder into a stream that
+// would open cleanly as truncated data. Only the first call counts: the error
+// that ended the stream is the one worth reporting.
+func (w *StreamWriter) fail(err error) error {
+	if w.err == nil {
+		w.err = err
+	}
+	return w.err
 }
 
 // StreamReader decrypts a stream produced by a [StreamWriter], one chunk at a
@@ -527,11 +600,27 @@ func (r *StreamReader) WriteTo(dst io.Writer) (int64, error) {
 			continue
 		}
 
+		// dst is caller-supplied, so the count it reports is checked before it
+		// is used, exactly as io.Copy checks it. Without this a writer
+		// returning more than it was given panics on the reslice below, and
+		// one returning (0, nil) forever spins here instead of returning.
 		n, err := dst.Write(r.plain)
+		if n < 0 || n > len(r.plain) {
+			r.fail(errBadWriteCount)
+			return total, r.err
+		}
+		short := n < len(r.plain)
 		r.plain = r.plain[n:]
 		total += int64(n)
 		if err != nil {
 			return total, err
+		}
+		if short {
+			// io.Writer requires a non-nil error with a short write, so this
+			// is a broken dst; io.Copy calls it io.ErrShortWrite too. Looping
+			// would ask the same writer the same question forever.
+			r.fail(io.ErrShortWrite)
+			return total, r.err
 		}
 	}
 }
@@ -612,7 +701,10 @@ func (s *Scheme) sealStream(masterKey []byte, dst io.Writer, src io.Reader, tag 
 
 	n, err := w.ReadFrom(src)
 	if err != nil {
-		w.abort()
+		// ReadFrom already made the error sticky, so Close would refuse to
+		// finalize; Abort is what wipes the buffered plaintext and says the
+		// fragment on dst was abandoned on purpose.
+		w.Abort()
 		return n, err
 	}
 	return n, w.Close()

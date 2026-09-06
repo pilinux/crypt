@@ -197,6 +197,7 @@ _, err = scheme.OpenStream(masterKey, w, r)
 
 // Or take the writer/reader themselves and compose freely.
 sw, err := scheme.SealWriter(masterKey, dst) // io.WriteCloser
+defer sw.Abort()                             // no-op once Close has succeeded
 _, err = io.Copy(sw, src)
 err = sw.Close() // seals the final chunk; the stream is only complete after this
 
@@ -392,9 +393,11 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
 - **A stream is only trustworthy once it ends.** The streaming API authenticates
   every chunk before releasing it, but a consumer that acts on partial output
   has acted on data whose stream may still fail. Treat the destination as
-  unusable until the call returns without error, and note that
-  `StreamWriter.Close` finalizes whatever was written. Call it only after the
-  whole input went in.
+  unusable until the call returns without error. `StreamWriter.Close`
+  finalizes a stream that has not failed and refuses one that has, so a source
+  that quit part-way cannot be closed into a valid short stream. Use
+  `StreamWriter.Abort` for the case nothing failed and you simply do not want
+  the stream: `defer sw.Abort()` costs nothing once `Close` has succeeded.
 - **Ciphertext reveals its plaintext length.** Both formats store enough in the
   clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
   for a stream. Content, key and context stay hidden, but size alone can
