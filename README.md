@@ -225,8 +225,10 @@ That is a 37-byte header plus one 16-byte tag per chunk, so a 10 GB file at
 the default 1 MiB chunk size grows by 160 KiB, about 0.0015%. Larger chunks
 mean less overhead and more memory per stream; smaller chunks the reverse.
 `MinChunkSize` (1 KiB) keeps the worst case under 2%, and `MaxChunkSize`
-(64 MiB) caps what a reader will allocate for a chunk size it read from an
-untrusted header.
+(64 MiB) is the widest the format allows. A reader allocates whatever the header
+names before anything authenticates, so a service that only writes small chunks
+should say so with `Config.MaxAcceptedChunkSize` rather than accept 64 MiB per
+concurrent open from a stranger.
 
 ### Hiding the file length
 
@@ -276,8 +278,8 @@ _, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
 ```
 
 Nothing has to carry `n` between the two stages: an unpadded stream is
-`37 + n + 16*ceil(n/ChunkSize)` bytes, so the sealed size gives the length
-back. A crash then leaves a valid sealed object rather than a lost upload.
+`StreamHeaderSize + n + 16*ceil(n/ChunkSize)` bytes, and `PlaintextLen` inverts
+that, so the sealed size gives the length back. A crash then leaves a valid sealed object rather than a lost upload.
 Which objects still owe a pass is the one thing this does not tell you for
 free: padded and plain blobs are deliberately indistinguishable, so an unpadded
 object opened as padded fails with `ErrStreamAuth`, exactly like a wrong key.
@@ -311,7 +313,7 @@ independently; use `RandomHex` names if that matters.
 | RSA-OAEP (`rsa.go`) | `Encoder.EncryptRSA` / `Decoder.DecryptRSA` (+ `Byte` variants) |
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
 | Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
-| Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader` (+ `AAD` variants) |
+| Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader`/`StreamWriter.Abort` (+ `AAD` variants), `StreamHeaderSize`, `PlaintextLen` |
 | Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream` (+ `AAD` variants), `PaddedSize` |
 
 The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
@@ -373,6 +375,7 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
 - **The envelope secret must be machine-generated.** `DeriveKEK` uses HKDF,
   which does no password stretching: generate `ENCRYPTION_SECRET` with
   `openssl rand -hex 32` (or similar) and never use a human-chosen passphrase.
+  The floor is 32 **bytes**, which is what `len(secret)` measures.
   A guessable secret can be brute-forced offline from the wrapped master key.
 - **Key sizes.** AES accepts 16/24/32-byte keys; ChaCha20 and XChaCha20 require
   exactly 32 bytes.
@@ -381,6 +384,10 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   `envelope` scheme, which give each item its own key or a large random nonce.
 - **Everything is authenticated.** All AEAD modes and RSA-OAEP fail closed:
   tampered ciphertext or a wrong key returns an error, never partial plaintext.
+  In the `envelope` package that error is a sentinel: `ErrEnvelopeAuth` for a
+  token or a wrapped key, `ErrStreamAuth` for a stream. Neither says which of
+  "wrong key", "wrong AAD" or "altered bytes" it was, since telling those apart
+  is what an attacker probing a datastore would want.
 - **Fail closed on bad input, never panic.** The `Decrypt…` functions that take
   a nonce directly validate its length (12 bytes for AES-GCM and
   ChaCha20-Poly1305, 24 for XChaCha20-Poly1305) and return an error on a

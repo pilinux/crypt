@@ -24,7 +24,7 @@ open it.
 
 [**Wire format**](#wire-format): the complete byte layout of both formats, with worked examples.
 
-Files: [`envelope.go`](#envelopego) · [`keys.go`](#keysgo) · [`cipher.go`](#ciphergo) · [`stream.go`](#streamgo) · [`file.go`](#filego) · [`padding.go`](#paddinggo) · [`hash.go`](#hashgo) · [tests](#test-files)
+Files: [`envelope.go`](#envelopego) · [`keys.go`](#keysgo) · [`cipher.go`](#ciphergo) · [`stream.go`](#streamgo) · [`file.go`](#filego) · [`padding.go`](#paddinggo) · [`exactreader.go`](#paddinggo) · [`hash.go`](#hashgo) · [tests](#test-files)
 
 ---
 
@@ -97,10 +97,12 @@ random nonce**.
 | 42 | ciphertext | `len(plaintext)` | XChaCha20 keystream XOR plaintext | AEAD |
 | 42 + n | tag | 16 (`TagSize`) | Poly1305 over ciphertext + AAD | AEAD |
 
-The reader (`unpackEnvelope`) accepts any `saltLen` in `1..255` and takes the
-salt length from the blob, so a future salt size still parses; the writer emits
-16 today. A blob shorter than `2 + saltLen + 24 + 16` cannot be authentic and is
-rejected as `ErrBadEnvelope` before any key is derived.
+The reader (`unpackEnvelope`) requires `saltLen` to be exactly `SaltSize`,
+since that is the only length the writer emits and the only one `DeriveSubKey`
+accepts. A blob shorter than `2 + 16 + 24 + 16` cannot be authentic either.
+Both are `ErrBadEnvelope`, reported before any key is derived: they describe
+untrusted wire data, not a caller's argument, which is what `ErrInvalidSaltSize`
+is for.
 
 #### What the AEAD actually gets
 
@@ -575,15 +577,18 @@ Package doc, shared constants/errors, `Scheme` construction, header codec.
 - `ErrSecretTooShort`: secret shorter than `MinSecretLength`.
 - `ErrInvalidKeySize`: key argument is not 32 bytes.
 - `ErrInvalidSaltSize`: salt argument is not 16 bytes.
-- `ErrBadEnvelope`: blob is not a well-formed envelope (bad version, bad length, bad base64).
+- `ErrBadEnvelope`: blob is not a well-formed envelope (bad version, a salt length other than 16, bad total length, bad base64).
 - `ErrNotAnInteger`: token authenticates but its plaintext is not the 8-byte int64 encoding.
+- `ErrEnvelopeAuth`: a well-formed envelope failed authentication, i.e. a wrong master key, a wrong or missing AAD, or an altered byte. The single-shot counterpart of `ErrStreamAuth`, and returned by `UnwrapKey` too, which is what makes the documented rotation check expressible.
 
 All generic on purpose, so an HTTP layer can return them without leaking detail.
+`ErrEnvelopeAuth` in particular says only that authentication failed, never
+which of the three reasons it was.
 
 ### Types
 
-- `Config`: `KEKLabel`, `SubKeyLabel`, `ChunkSize`. Empty label falls back to the package default; `ChunkSize` 0 falls back to `DefaultChunkSize`.
-- `Scheme`: holds the two labels and the chunk size. Immutable and concurrency-safe; label-dependent operations are methods on it.
+- `Config`: `KEKLabel`, `SubKeyLabel`, `ChunkSize`, `MaxAcceptedChunkSize`. Empty label falls back to the package default; `ChunkSize` 0 falls back to `DefaultChunkSize`; `MaxAcceptedChunkSize` 0 falls back to `MaxChunkSize`.
+- `Scheme`: holds the two labels, the chunk size and the reader ceiling. Immutable and concurrency-safe; label-dependent operations are methods on it.
 
 ### Functions
 
@@ -592,7 +597,7 @@ All generic on purpose, so an HTTP layer can return them without leaking detail.
 - `randomBytes(n)`: n bytes from `crypto/rand`, the one randomness source in the package.
 - `buildHeader(salt)`: `version || saltLen || salt`. Rejects a salt outside 1..255 so the length byte cannot overflow.
 - `authData(header, aad)`: `header || aad`, the AEAD additional data of the **single-shot** format. A nil or empty aad authenticates the header alone, with no copy made. Unambiguous because the header states its own length in `saltLen`; the streaming format cannot rely on that and uses `streamAuthData` instead.
-- `unpackEnvelope(blob)`: split into header, salt and ciphertext (all aliasing `blob`). Rejects a wrong version byte, a zero salt length, or a blob too short to hold nonce plus tag.
+- `unpackEnvelope(blob)`: split into header, salt and ciphertext (all aliasing `blob`). Rejects a wrong version byte, any salt length other than `SaltSize`, or a blob too short to hold nonce plus tag, all as `ErrBadEnvelope`.
 
 ## keys.go
 
@@ -641,10 +646,11 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 
 ### Constants and errors
 
-- `DefaultChunkSize` = 1 MiB, `MinChunkSize` = 1 KiB (keeps tag overhead under 2%), `MaxChunkSize` = 64 MiB (caps what a hostile header can make a reader allocate).
+- `DefaultChunkSize` = 1 MiB, `MinChunkSize` = 1 KiB (keeps tag overhead under 2%), `MaxChunkSize` = 64 MiB (the widest chunk the format allows, and the default ceiling a reader will honour from a header).
+- `StreamHeaderSize` = 37: the cleartext header every stream begins with, exported so callers can do the format's size arithmetic without copying the constant.
 - `streamVersion` = `0x81`: high bit set so it can never collide with `envelopeVersion`, and each reader rejects the other's blob up front.
 - `streamNoncePrefixSize` = 15, `streamCounterSize` = 8, `streamChunkSizeWidth` = 4, `streamHeaderSize` = 37.
-- `ErrInvalidChunkSize`: chunk size (from `Config` or from a header) outside `MinChunkSize`..`MaxChunkSize`.
+- `ErrInvalidChunkSize`: chunk size outside `MinChunkSize`..`MaxChunkSize`, whether it came from `Config.ChunkSize`, from `Config.MaxAcceptedChunkSize`, or from a stream header that exceeds the ceiling this `Scheme` accepts.
 - `ErrBadStream`: bad header, or a chunk too short to hold a tag.
 - `ErrStreamAuth`: chunk failed authentication. Wrong key or aad, modified data, or chunks reordered, duplicated, dropped or truncated.
 - `ErrStreamClosed`: `Write` after a clean `Close`. A writer that failed or was aborted reports what ended it instead.
@@ -653,7 +659,9 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 ### Header and nonce helpers
 
 - `buildStreamHeader(salt, chunkSize, noncePrefix)`: assemble the 37-byte cleartext header, validating all three inputs.
-- `parseStreamHeader(header)`: validate and split it back into salt, chunk size and nonce prefix (aliasing `header`). The chunk size always comes from the stream, never from the `Scheme`, so changing `Config.ChunkSize` never orphans data.
+- `parseStreamHeader(header)`: validate and split it back into salt, chunk size and nonce prefix (aliasing `header`). The chunk size always comes from the stream, never from the `Scheme`, so changing `Config.ChunkSize` never orphans data. `openReader` then checks it against `Config.MaxAcceptedChunkSize` before allocating, since nothing is authenticated yet at that point.
+- `PlaintextLen(sealed, chunkSize)`: invert `StreamHeaderSize + n + TagSize*ceil(n/chunkSize)` to recover `n` from a sealed size, reporting false when no length produces that size. The answer is unique because the chunk count never falls as `n` grows, and the search is a couple of candidates whatever the size. It inverts the **unpadded** format; on a padded stream it returns the padded length, not the payload length the padding exists to hide.
+- `checkReadCeiling()`: validate `Config.MaxAcceptedChunkSize`, reported when a stream is created rather than at `New`, exactly as `ChunkSize` is.
 - `streamNonce(dst, prefix, counter, final)`: `prefix(15) || counter(8 BE) || finalFlag(1)`. The counter pins a chunk to its position and the flag marks the last one, which is what makes reorder, duplicate, drop and truncate authentication failures.
 - `(*Scheme) streamAEAD(masterKey, salt)`: `DeriveSubKey` → one long-lived `chacha20poly1305.NewX` AEAD. The local sub-key copy is wiped immediately.
 
@@ -738,6 +746,10 @@ numbers.
 - `padme(l)`: rounds l up so only its top `log2(log2(l))` bits are significant.
   Overhead capped near 12%, about 3% on average. An overflow near `MaxInt64`
   leaves the length unpadded rather than wrapping.
+`zeroReader` and `exactReader` live in **`exactreader.go`**, since neither
+knows anything about padding: they turn a caller's reader and a declared length
+into a source that delivers exactly that many bytes or says which way it missed.
+
 - `zeroReader`: an endless run of zeros. The padding is XORed with the
   keystream like real data, so zeros are indistinguishable once sealed.
 - `exactReader`: yields exactly `size` bytes from `src`, then EOF, failing with
@@ -807,7 +819,12 @@ numbers.
   payload is still unread; it never closes the source and repeats itself.
 - `(*PaddedReader) finish()` / `fail(err)`: the bounded drain plus end probe,
   and the sticky terminal state, which also ends the `StreamReader` underneath
-  so the chunk it holds is wiped.
+  so the chunk it holds is wiped. The drain **verifies** the padding rather than
+  discarding it: it reads through a 512-byte buffer and any non-zero byte is
+  `ErrPaddingMalformed`. Only a key holder can build such a stream, so this is
+  not about forgery; it is that padding no reader ever looked at is space
+  something could have been hidden in, inside a format whose whole point is to
+  give nothing away.
 - `(*Scheme) OpenPaddedStream(masterKey, dst, src)` → `OpenPaddedStreamAAD(..., nil)`.
 - `(*Scheme) OpenPaddedStreamAAD(masterKey, dst, src, aad)`:
   `OpenPaddedReaderAAD` → `WriteTo`, the same shape `OpenStreamAAD` has over

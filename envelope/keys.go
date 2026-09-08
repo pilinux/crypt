@@ -48,9 +48,11 @@ func WrapKey(kek, masterKey []byte) ([]byte, error) {
 	return crypt.EncryptByteXChacha20poly1305WithNonceAppended(kek, masterKey)
 }
 
-// UnwrapKey decrypts a KEK-wrapped master key produced by [WrapKey]. A non-nil
-// error means the KEK is wrong (e.g. the secret changed), the stored value was
-// tampered with, or the wrapped plaintext is not a 32-byte key.
+// UnwrapKey decrypts a KEK-wrapped master key produced by [WrapKey]. It
+// returns [ErrEnvelopeAuth] when the KEK is wrong (e.g. the secret changed) or
+// the stored value was tampered with, which is the check that makes secret
+// rotation detectable, and [ErrInvalidKeySize] when the blob authenticates but
+// its plaintext is not a 32-byte key.
 func UnwrapKey(kek, wrapped []byte) ([]byte, error) {
 	if len(kek) != KeySize {
 		return nil, ErrInvalidKeySize
@@ -58,7 +60,7 @@ func UnwrapKey(kek, wrapped []byte) ([]byte, error) {
 
 	masterKey, err := crypt.DecryptByteXChacha20poly1305WithNonceAppended(kek, wrapped)
 	if err != nil {
-		return nil, err
+		return nil, ErrEnvelopeAuth
 	}
 	if len(masterKey) != KeySize {
 		// authentic under the KEK but not a master key: the blob was not

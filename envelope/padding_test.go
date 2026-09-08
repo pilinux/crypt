@@ -1992,3 +1992,93 @@ func TestPaddedStreamIgnoresTagShapedAAD(t *testing.T) {
 		t.Error("payload did not survive the round trip")
 	}
 }
+
+// TestPaddingContentIsVerified pins that the padding is read back and checked,
+// not merely discarded. Only a key holder can build such a stream, so this is
+// not about forgery: it is that space every reader threw away unexamined is
+// space something could have been hidden in, inside a format whose whole point
+// is to give nothing away.
+func TestPaddingContentIsVerified(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, paddedTestSize)
+
+	frame := make([]byte, paddingFrameSize)
+	frame[0] = paddingVersion
+	binary.BigEndian.PutUint64(frame[1:], uint64(len(payload)))
+	padLen := PaddedSize(int64(len(payload))) - paddingFrameSize - int64(len(payload))
+	if padLen < 2 {
+		t.Fatalf("need padding to corrupt, got %d bytes", padLen)
+	}
+
+	build := func(mutate func(pad []byte)) []byte {
+		pad := make([]byte, padLen)
+		mutate(pad)
+		plain := append(append(append([]byte{}, frame...), payload...), pad...)
+		return sealAsPadded(t, s, masterKey, plain, nil)
+	}
+
+	t.Run("zerosAreAccepted", func(t *testing.T) {
+		var out bytes.Buffer
+		n, err := s.OpenPaddedStream(masterKey, &out, bytes.NewReader(build(func([]byte) {})))
+		if err != nil {
+			t.Fatalf("OpenPaddedStream error: %v", err)
+		}
+		if n != int64(len(payload)) || !bytes.Equal(out.Bytes(), payload) {
+			t.Error("the payload did not survive")
+		}
+	})
+
+	// one byte anywhere in the padding is enough, including the very last one,
+	// which is what a naive "check the first block" would miss
+	for _, tt := range []struct {
+		name string
+		at   int64
+	}{
+		{"firstByte", 0},
+		{"middle", padLen / 2},
+		{"lastByte", padLen - 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			blob := build(func(pad []byte) { pad[tt.at] = 0xFF })
+			if _, err := s.OpenPaddedStream(masterKey, io.Discard, bytes.NewReader(blob)); !errors.Is(err, ErrPaddingMalformed) {
+				t.Errorf("err = %v, want ErrPaddingMalformed", err)
+			}
+			// the pull form reaches the same verdict, through Close
+			r, err := s.OpenPaddedReader(masterKey, bytes.NewReader(blob))
+			if err != nil {
+				t.Fatalf("OpenPaddedReader error: %v", err)
+			}
+			if _, err := io.CopyN(io.Discard, r, r.Size()); err != nil {
+				t.Fatalf("reading the payload: %v", err)
+			}
+			if err := r.Close(); !errors.Is(err, ErrPaddingMalformed) {
+				t.Errorf("Close: err = %v, want ErrPaddingMalformed", err)
+			}
+		})
+	}
+}
+
+// TestPaddedStreamTruncationIsAuthFailure pins the behaviour two doc comments
+// used to describe wrongly. Truncation is caught by the chunk chain, so it is
+// ErrStreamAuth; ErrPaddingMalformed is for a stream that authenticates whole
+// and still contradicts its own frame.
+func TestPaddedStreamTruncationIsAuthFailure(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	blob := sealPaddedBlob(t, s, masterKey, randomData(t, paddedTestSize))
+
+	for _, cut := range []int{testChunkSize + TagSize, 2 * (testChunkSize + TagSize), 1} {
+		short := blob[:len(blob)-cut]
+		err := func() error {
+			_, e := s.OpenPaddedStream(masterKey, io.Discard, bytes.NewReader(short))
+			return e
+		}()
+		if !errors.Is(err, ErrStreamAuth) {
+			t.Errorf("cut %d bytes: err = %v, want ErrStreamAuth", cut, err)
+		}
+		if errors.Is(err, ErrNotPadded) {
+			t.Errorf("cut %d bytes: truncation must not report the padded-format umbrella", cut)
+		}
+	}
+}

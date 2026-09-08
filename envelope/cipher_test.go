@@ -2,6 +2,7 @@ package envelope
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -317,4 +318,55 @@ func TestSealOpenInt64(t *testing.T) {
 			t.Error("OpenInt64AAD with wrong AAD succeeded, want failure")
 		}
 	})
+}
+
+// TestOpenReportsAuthFailure covers the sentinel the single-shot half was
+// missing: an authentication failure used to come back as an opaque string from
+// the root package, unmatched by any errors.Is and unwrappable to nothing, so a
+// caller could only tell "wrong key or tampered" from anything else by
+// comparing message text.
+func TestOpenReportsAuthFailure(t *testing.T) {
+	s := Default()
+	masterKey := newMasterKey(t)
+	other := newMasterKey(t)
+
+	blob, err := s.SealBytesAAD(masterKey, []byte("secret"), []byte("row:1"))
+	if err != nil {
+		t.Fatalf("SealBytesAAD error: %v", err)
+	}
+	token, err := s.SealStringAAD(masterKey, "secret", []byte("row:1"))
+	if err != nil {
+		t.Fatalf("SealStringAAD error: %v", err)
+	}
+	intToken, err := s.SealInt64(masterKey, 42)
+	if err != nil {
+		t.Fatalf("SealInt64 error: %v", err)
+	}
+
+	tampered := append([]byte{}, blob...)
+	tampered[len(tampered)-1] ^= 0xFF
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"wrongKey", func() error { _, e := s.OpenBytesAAD(other, blob, []byte("row:1")); return e }},
+		{"wrongAAD", func() error { _, e := s.OpenBytesAAD(masterKey, blob, []byte("row:2")); return e }},
+		{"missingAAD", func() error { _, e := s.OpenBytes(masterKey, blob); return e }},
+		{"tampered", func() error { _, e := s.OpenBytesAAD(masterKey, tampered, []byte("row:1")); return e }},
+		{"string", func() error { _, e := s.OpenStringAAD(masterKey, token, []byte("row:2")); return e }},
+		{"int64", func() error { _, e := s.OpenInt64(other, intToken); return e }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call()
+			if !errors.Is(err, ErrEnvelopeAuth) {
+				t.Errorf("err = %v, want ErrEnvelopeAuth", err)
+			}
+			// a malformed blob is a different thing and must stay so
+			if errors.Is(err, ErrBadEnvelope) {
+				t.Error("an authentication failure must not report ErrBadEnvelope")
+			}
+		})
+	}
 }

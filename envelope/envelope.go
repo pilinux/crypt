@@ -162,7 +162,7 @@ const (
 // HTTP layer never leaks internal detail to API consumers.
 var (
 	// ErrSecretTooShort is returned when the secret is below MinSecretLength.
-	ErrSecretTooShort = errors.New("envelope: secret must be at least 32 characters")
+	ErrSecretTooShort = errors.New("envelope: secret must be at least 32 bytes")
 
 	// ErrInvalidKeySize is returned when a key argument is not KeySize bytes.
 	ErrInvalidKeySize = errors.New("envelope: key must be 32 bytes")
@@ -178,6 +178,15 @@ var (
 	// produced by [Scheme.SealInt64] (for example a token that was sealed by
 	// [Scheme.SealString]).
 	ErrNotAnInteger = errors.New("envelope: sealed value is not an integer")
+
+	// ErrEnvelopeAuth is returned when a well-formed envelope fails
+	// authentication: a wrong master key, a wrong or missing AAD, or any
+	// altered byte. It is the single-shot counterpart of [ErrStreamAuth].
+	//
+	// [UnwrapKey] returns it too, which is what makes the documented rotation
+	// check expressible: a KEK that can no longer unwrap the stored master key
+	// means the secret changed.
+	ErrEnvelopeAuth = errors.New("envelope: authentication failed")
 )
 
 // Config configures the HKDF domain-separation labels of a [Scheme]. An empty
@@ -195,20 +204,38 @@ type Config struct {
 	// created. Unlike the labels it is not frozen: every stream records its
 	// own chunk size, so changing this never orphans sealed data.
 	ChunkSize int
+
+	// MaxAcceptedChunkSize caps the chunk size a reader will honour from a
+	// stream header, in bytes, within [MinChunkSize]..[MaxChunkSize]. Zero
+	// falls back to [MaxChunkSize].
+	//
+	// It exists because the header is read before anything authenticates: a
+	// 37-byte prefix names the chunk size and the reader allocates that much
+	// before the first tag is checked, so a stranger can cost a service 64 MiB
+	// per concurrent open. A deployment that only ever writes 1 MiB chunks can
+	// say so here and turn that into [ErrInvalidChunkSize].
+	//
+	// Keep it at or above the ChunkSize you seal with. Set it any lower and
+	// your own streams stop opening, which is a quiet way to lock yourself out
+	// of your data; that is why the default is the widest size the format
+	// allows rather than the chunk size you happen to write today.
+	MaxAcceptedChunkSize int
 }
 
 // Scheme carries the domain-separation labels used by the label-dependent
 // operations ([Scheme.DeriveKEK], [Scheme.DeriveSubKey] and the Seal/Open
 // family). It is immutable after construction and safe for concurrent use.
 type Scheme struct {
-	kekLabel    string
-	subKeyLabel string
-	chunkSize   int
+	kekLabel     string
+	subKeyLabel  string
+	chunkSize    int
+	maxChunkSize int
 }
 
 // New returns a [Scheme] using the labels in cfg, falling back to
-// [DefaultKEKLabel] / [DefaultSubKeyLabel] for any label left empty and to
-// [DefaultChunkSize] for an unset chunk size.
+// [DefaultKEKLabel] / [DefaultSubKeyLabel] for any label left empty, to
+// [DefaultChunkSize] for an unset chunk size and to [MaxChunkSize] for an
+// unset reader ceiling.
 func New(cfg Config) *Scheme {
 	if cfg.KEKLabel == "" {
 		cfg.KEKLabel = DefaultKEKLabel
@@ -219,10 +246,14 @@ func New(cfg Config) *Scheme {
 	if cfg.ChunkSize == 0 {
 		cfg.ChunkSize = DefaultChunkSize
 	}
+	if cfg.MaxAcceptedChunkSize == 0 {
+		cfg.MaxAcceptedChunkSize = MaxChunkSize
+	}
 	return &Scheme{
-		kekLabel:    cfg.KEKLabel,
-		subKeyLabel: cfg.SubKeyLabel,
-		chunkSize:   cfg.ChunkSize,
+		kekLabel:     cfg.KEKLabel,
+		subKeyLabel:  cfg.SubKeyLabel,
+		chunkSize:    cfg.ChunkSize,
+		maxChunkSize: cfg.MaxAcceptedChunkSize,
 	}
 }
 
@@ -284,10 +315,14 @@ func unpackEnvelope(blob []byte) (header, salt, ciphertext []byte, err error) {
 		return nil, nil, nil, ErrBadEnvelope
 	}
 
-	saltLen := int(blob[1])
-	if saltLen == 0 {
+	// The format writes SaltSize and DeriveSubKey accepts nothing else, so a
+	// different length is a malformed blob, not a salt this package could use.
+	// Rejecting it here keeps untrusted wire data reporting ErrBadEnvelope
+	// instead of ErrInvalidSaltSize, which names a caller's argument.
+	if int(blob[1]) != SaltSize {
 		return nil, nil, nil, ErrBadEnvelope
 	}
+	saltLen := SaltSize
 
 	// the blob must hold the header, the full salt and at least a
 	// nonce + tag worth of ciphertext, otherwise it cannot be authentic.

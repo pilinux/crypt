@@ -21,6 +21,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -55,6 +56,12 @@ func limitBody(w http.ResponseWriter, r *http.Request) io.ReadCloser {
 
 // object is one stored upload. Sealed and Plain are kept apart so the page can
 // show what padding costs.
+//
+// The store holds these by value and hands out copies, so a handler reading an
+// object can never be racing the handler that pads one. Its methods take value
+// receivers for the same reason: a copy has to answer every question the
+// original does, and html/template calls them on slice elements it cannot
+// address.
 type object struct {
 	ID     string
 	Name   string
@@ -63,10 +70,14 @@ type object struct {
 	Sealed int64  // bytes on disk
 	Digest string // sha256 of the plaintext, for verifying a download
 	When   time.Time
+
+	// padding is true while a pad request holds this object, so a second one
+	// does not repeat the work. Not rendered; the page shows Padded.
+	padding bool
 }
 
 // Overhead reports the sealed size as a percentage over the payload.
-func (o *object) Overhead() string {
+func (o object) Overhead() string {
 	if o.Plain == 0 {
 		return "-"
 	}
@@ -76,7 +87,7 @@ func (o *object) Overhead() string {
 // Expect reports what this object would occupy on disk once padded, so the
 // column is comparable with the sealed size beside it rather than with the
 // padded plaintext length, which is 37 + 16*chunks smaller.
-func (o *object) Expect() int64 {
+func (o object) Expect() int64 {
 	padded := envelope.PaddedSize(o.Plain)
 	if padded == 0 {
 		return 0
@@ -85,7 +96,7 @@ func (o *object) Expect() int64 {
 	if chunks == 0 {
 		chunks = 1
 	}
-	return streamHeaderSize + padded + envelope.TagSize*chunks
+	return envelope.StreamHeaderSize + padded + envelope.TagSize*chunks
 }
 
 // store holds the sealed objects and the key material for one server run.
@@ -94,8 +105,11 @@ type store struct {
 	masterKey []byte
 	dir       string
 
+	// mu guards objs and order. Nothing escapes it: objs holds objects by
+	// value and every accessor copies, so there is no pointer a handler could
+	// still be reading while another writes through it.
 	mu    sync.Mutex
-	objs  map[string]*object
+	objs  map[string]object
 	order []string
 }
 
@@ -108,30 +122,67 @@ func (s *store) aad(id string) []byte { return []byte("object:" + id) }
 func (s *store) path(id string) string { return filepath.Join(s.dir, id+".enc") }
 
 // add records a freshly sealed object.
-func (s *store) add(o *object) {
+func (s *store) add(o object) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.objs[o.ID] = o
 	s.order = append([]string{o.ID}, s.order...)
 }
 
-// get returns one object.
-func (s *store) get(id string) (*object, bool) {
+// get returns a copy of one object, which is the caller's to read for as long
+// as it likes: a later pad updates the store, not the copy.
+func (s *store) get(id string) (object, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	o, ok := s.objs[id]
 	return o, ok
 }
 
-// list returns the objects newest first.
-func (s *store) list() []*object {
+// list returns copies of the objects, newest first.
+func (s *store) list() []object {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*object, 0, len(s.order))
+	out := make([]object, 0, len(s.order))
 	for _, id := range s.order {
 		out = append(out, s.objs[id])
 	}
 	return out
+}
+
+// beginPad claims an object for padding: it reports the object only if it is
+// unpadded and nobody else is already padding it, and marks it in flight.
+//
+// The check and the claim have to be one critical section. Reading Padded,
+// doing the reseal and then setting it is a check-then-act: two requests both
+// pass the check, both reseal, both rename over the same path, and the second
+// may find the first's padded blob where it expected a plain one and report a
+// 500 for an object that is perfectly fine.
+func (s *store) beginPad(id string) (o object, claimed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.objs[id]
+	if !ok || o.Padded || o.padding {
+		return o, false
+	}
+	o.padding = true
+	s.objs[id] = o
+	return o, true
+}
+
+// endPad releases a claim. sealed > 0 records a finished pad; 0 abandons it, so
+// a failed attempt can be retried.
+func (s *store) endPad(id string, sealed int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.objs[id]
+	if !ok {
+		return
+	}
+	o.padding = false
+	if sealed > 0 {
+		o.Padded, o.Sealed = true, sealed
+	}
+	s.objs[id] = o
 }
 
 // serve runs the upload server until interrupted. dir is where ciphertext goes
@@ -166,7 +217,7 @@ func serve(addr, dir string, limit int64) error {
 		return err
 	}
 
-	s := &store{scheme: scheme, masterKey: masterKey, dir: dir, objs: map[string]*object{}}
+	s := &store{scheme: scheme, masterKey: masterKey, dir: dir, objs: map[string]object{}}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.index)
@@ -186,13 +237,13 @@ func serve(addr, dir string, limit int64) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	cap := "none"
+	limitText := "none"
 	if maxUpload > 0 {
-		cap = fmt.Sprintf("%d bytes", maxUpload)
+		limitText = fmt.Sprintf("%d bytes", maxUpload)
 	}
 	fmt.Printf("envelope upload server on http://%s\n", addr)
 	fmt.Printf("ciphertext dir: %s\n", dir)
-	fmt.Printf("upload cap: %s (-max), chunk size: %d bytes\n", cap, envelope.DefaultChunkSize)
+	fmt.Printf("upload cap: %s (-max), chunk size: %d bytes\n", limitText, envelope.DefaultChunkSize)
 	fmt.Println("memory stays at one chunk whatever the file size; padding needs")
 	fmt.Println("room for a second copy while it reseals, so size the disk for 2x")
 	fmt.Println("the master key lives only in memory, so the files die with the process")
@@ -249,11 +300,10 @@ func (s *store) upload(w http.ResponseWriter, r *http.Request) {
 }
 
 // sealPart streams one multipart file part into the store, sealed and unpadded.
-func (s *store) sealPart(part io.Reader) error {
-	name := "upload"
-	if p, ok := part.(interface{ FileName() string }); ok && p.FileName() != "" {
-		name = p.FileName()
-	}
+// The caller has already established that the part carries a filename, so the
+// concrete type comes in rather than an io.Reader plus a way to rediscover it.
+func (s *store) sealPart(part *multipart.Part) error {
+	name := part.FileName()
 	if len(name) > maxNameLen {
 		name = name[:maxNameLen]
 	}
@@ -281,9 +331,11 @@ func (s *store) sealPart(part io.Reader) error {
 
 	info, err := os.Stat(s.path(id))
 	if err != nil {
+		// nothing references this file, so it would never be cleaned up
+		_ = os.Remove(s.path(id))
 		return err
 	}
-	s.add(&object{
+	s.add(object{
 		ID: id, Name: name, Plain: n, Sealed: info.Size(),
 		Digest: hex.EncodeToString(sum.Sum(nil)), When: time.Now(),
 	})
@@ -339,10 +391,11 @@ func (s *store) uploadRaw(w http.ResponseWriter, r *http.Request) {
 
 	info, err := os.Stat(s.path(id))
 	if err != nil {
+		_ = os.Remove(s.path(id))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.add(&object{
+	s.add(object{
 		ID: id, Name: name, Padded: true, Plain: n, Sealed: info.Size(),
 		Digest: hex.EncodeToString(sum.Sum(nil)), When: time.Now(),
 	})
@@ -354,15 +407,20 @@ func (s *store) uploadRaw(w http.ResponseWriter, r *http.Request) {
 // only ever exists one chunk at a time, in memory.
 func (s *store) pad(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	o, ok := s.get(id)
-	if !ok {
+	if _, ok := s.get(id); !ok {
 		http.NotFound(w, r)
 		return
 	}
-	if o.Padded {
+
+	// One claim per object: whoever gets it does the work, everyone else is
+	// redirected to a page that will show the result.
+	o, claimed := s.beginPad(id)
+	if !claimed {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	sealed := int64(0)
+	defer func() { s.endPad(id, sealed) }()
 
 	src, err := os.Open(s.path(id))
 	if err != nil {
@@ -383,6 +441,12 @@ func (s *store) pad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err = s.scheme.SealPaddedStreamAAD(s.masterKey, tmp, plain, o.Plain, s.aad(id))
+	if err == nil {
+		// Reach the platter before the rename: this replaces the only copy of
+		// the object, so a crash in between must not leave a short file where a
+		// whole one was. The library's own pipeFile syncs for the same reason.
+		err = tmp.Sync()
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
@@ -396,16 +460,27 @@ func (s *store) pad(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	syncDir(s.dir) // make the rename itself durable
 
 	info, err := os.Stat(s.path(id))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.mu.Lock()
-	o.Padded, o.Sealed = true, info.Size()
-	s.mu.Unlock()
+	sealed = info.Size() // the deferred endPad records it
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// syncDir flushes a directory entry, which is what makes a rename survive a
+// crash. Best effort: on a filesystem that refuses to open a directory for
+// this there is nothing useful to report or do.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // download streams the plaintext back. Which opener to use comes from the

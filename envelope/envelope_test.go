@@ -2,6 +2,8 @@ package envelope
 
 import (
 	"bytes"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -128,4 +130,39 @@ func TestSchemeLabels(t *testing.T) {
 			t.Error("empty config did not fall back to default labels")
 		}
 	})
+}
+
+// TestUnpackEnvelopeRejectsForeignSaltLen pins that a salt length the format
+// never writes is a malformed envelope. It used to pass the parser and fail two
+// calls later as ErrInvalidSaltSize, which names a caller's argument rather
+// than untrusted wire data, so a handler mapping errors to status codes could
+// not tell a bad request from its own bug.
+func TestUnpackEnvelopeRejectsForeignSaltLen(t *testing.T) {
+	for _, saltLen := range []int{1, 8, 15, 17, 32, 255} {
+		blob := make([]byte, 2+saltLen+NonceSize+TagSize)
+		blob[0] = envelopeVersion
+		blob[1] = byte(saltLen)
+
+		if _, _, _, err := unpackEnvelope(blob); !errors.Is(err, ErrBadEnvelope) {
+			t.Errorf("saltLen %d: err = %v, want ErrBadEnvelope", saltLen, err)
+		}
+		if _, err := Default().OpenBytes(make([]byte, KeySize), blob); !errors.Is(err, ErrBadEnvelope) {
+			t.Errorf("saltLen %d via OpenBytes: err = %v, want ErrBadEnvelope", saltLen, err)
+		}
+	}
+}
+
+// TestErrSecretTooShortCountsBytes pins the message against the rule it
+// describes: len(secret) is bytes, so the text may not promise characters.
+func TestErrSecretTooShortCountsBytes(t *testing.T) {
+	if strings.Contains(ErrSecretTooShort.Error(), "characters") {
+		t.Error("the message says characters, but the check counts bytes")
+	}
+	// 16 two-byte runes: 16 characters, 32 bytes, and accepted
+	if _, err := Default().DeriveKEK(strings.Repeat("é", 16)); err != nil {
+		t.Errorf("32 bytes of multi-byte runes: err = %v, want nil", err)
+	}
+	if _, err := Default().DeriveKEK(strings.Repeat("a", MinSecretLength-1)); !errors.Is(err, ErrSecretTooShort) {
+		t.Errorf("31 bytes: err = %v, want ErrSecretTooShort", err)
+	}
 }

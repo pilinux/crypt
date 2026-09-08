@@ -57,12 +57,6 @@ import (
 	"github.com/pilinux/crypt/envelope"
 )
 
-// streamHeaderSize mirrors the stream header the envelope package writes,
-// version(1) || saltLen(1) || salt || chunkSize(4) || noncePrefix, whose parts
-// are exported even though the total is not. The nonce prefix is what is left
-// of a nonce after the 8-byte chunk counter and the 1-byte final flag.
-const streamHeaderSize = 2 + envelope.SaltSize + 4 + envelope.NonceSize - 9
-
 func main() {
 	addr := flag.String("serve", "", "run the upload server on this address instead of the demos, e.g. 127.0.0.1:8080")
 	dir := flag.String("dir", "", "where the server keeps ciphertext (default: a fresh temp dir)")
@@ -516,10 +510,10 @@ func deferredPaddingDemo(masterKey []byte) error {
 	fmt.Printf("                      stored unpadded: %d bytes; content hidden, length not\n", stored.Len())
 
 	// Stage 2, the background job. The length is not stored anywhere: an
-	// unpadded stream is 37 + n + 16*ceil(n/chunkSize) bytes, and that inverts
-	// exactly. The leak padding exists to remove is what tells the padder how
-	// much to pad.
-	size, ok := plaintextLen(int64(stored.Len()), chunkSize)
+	// unpadded stream is StreamHeaderSize + n + 16*ceil(n/chunkSize) bytes, and
+	// envelope.PlaintextLen inverts that exactly. The leak padding exists to
+	// remove is what tells the padder how much to pad.
+	size, ok := envelope.PlaintextLen(int64(stored.Len()), chunkSize)
 	fmt.Printf("                      length recovered from the sealed size alone = %d (exact=%t)\n",
 		size, ok && size == n)
 	if !ok {
@@ -586,37 +580,12 @@ func browserUpload(payload []byte) *multipart.Part {
 	return part
 }
 
-// plaintextLen inverts the sealed size of an unpadded stream,
-// 37 + n + 16*ceil(n/chunkSize), so a padder can learn the payload length from
-// the file size without anything having recorded it. The tag count is the only
-// unknown, and it is bounded tightly enough to just try the few candidates.
-func plaintextLen(sealed, chunkSize int64) (int64, bool) {
-	body := sealed - streamHeaderSize
-	for chunks := body/(chunkSize+envelope.TagSize) - 1; chunks <= body/chunkSize+1; chunks++ {
-		if chunks < 1 {
-			continue
-		}
-		n := body - envelope.TagSize*chunks
-		if n < 0 {
-			continue
-		}
-		want := n/chunkSize + 1
-		if n > 0 && n%chunkSize == 0 {
-			want = n / chunkSize
-		}
-		if want == chunks {
-			return n, true
-		}
-	}
-	return 0, false
-}
-
 // dumpStreamHeader prints the cleartext header at the start of a sealed
 // stream: version, salt and the parameters needed to rebuild the chunk keys
 // and nonces.
 func dumpStreamHeader(blob []byte) {
 	prefixLen := envelope.NonceSize - 9 // counter(8) + final flag(1)
-	if len(blob) < 2+envelope.SaltSize+4+prefixLen {
+	if len(blob) < envelope.StreamHeaderSize {
 		fmt.Println("  too short to be a sealed stream")
 		return
 	}

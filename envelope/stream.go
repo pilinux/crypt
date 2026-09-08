@@ -75,6 +75,63 @@ const (
 	streamHeaderSize = envelopeHeaderSize + SaltSize + streamChunkSizeWidth + streamNoncePrefixSize
 )
 
+// StreamHeaderSize is the cleartext header every sealed stream begins with:
+// version(1) || saltLen(1) || salt(16) || chunkSize(4) || noncePrefix(15).
+//
+// It is exported so callers can do the size arithmetic the format implies
+// without copying the constant. A stream of n plaintext bytes occupies
+// StreamHeaderSize + n + TagSize*ceil(n/chunkSize) bytes, at least one chunk;
+// [PlaintextLen] inverts that.
+const StreamHeaderSize = streamHeaderSize
+
+// PlaintextLen recovers the plaintext length of an unpadded stream from its
+// sealed size, given the chunk size it was sealed with. It reports false if no
+// plaintext length produces that size.
+//
+// It exists for the deferred-padding pattern, where an upload of unknown length
+// is sealed unpadded now and re-sealed padded later: the padded sealer needs a
+// length, and the sealed size is where that length already is. Nothing has to
+// carry it between the two passes.
+//
+// The answer is unique when it exists, because ceil(n/chunkSize) never falls as
+// n grows, so at most one chunk count is consistent with a given size.
+//
+// This inverts the *unpadded* format. A padded stream reports the padded length
+// (its [PaddedSize] bucket), not the payload length inside it, which is by
+// design: that is the number the padding exists to hide, and only opening the
+// stream reveals it.
+func PlaintextLen(sealed int64, chunkSize int) (int64, bool) {
+	if chunkSize < MinChunkSize || chunkSize > MaxChunkSize {
+		return 0, false
+	}
+	cs := int64(chunkSize)
+
+	body := sealed - StreamHeaderSize
+	if body < TagSize {
+		return 0, false
+	}
+	// The chunk count is bracketed tightly: at least body/(chunkSize+TagSize),
+	// since no chunk carries more than chunkSize plaintext plus its tag, and at
+	// most body/chunkSize+1, since the plaintext is no longer than the body.
+	for chunks := body / (cs + TagSize); chunks <= body/cs+1; chunks++ {
+		if chunks < 1 {
+			continue
+		}
+		n := body - TagSize*chunks
+		if n < 0 {
+			return 0, false
+		}
+		want := n/cs + 1
+		if n > 0 && n%cs == 0 {
+			want = n / cs
+		}
+		if want == chunks {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
 // Stream format tags. Every stream authenticates one of these, hashed together
 // with the caller's AAD by streamAuthData, which is what keeps the two formats
 // apart while their bytes on disk stay identical: neither reader accepts the
@@ -160,6 +217,12 @@ var (
 	// breaking the io.Writer contract. Unexported for the same reason io.Copy
 	// keeps errInvalidWrite unexported: nothing can be done about it but stop.
 	errBadWriteCount = errors.New("envelope: destination returned an invalid write count")
+
+	// errStreamInvariant: a construction fault inside this package, unreachable
+	// from any input. Kept apart from ErrBadStream, which describes untrusted
+	// data, so a report lands on the right component; the padded sealer draws
+	// the same line with errPaddingInvariant.
+	errStreamInvariant = errors.New("envelope: stream construction invariant failed")
 )
 
 // buildStreamHeader assembles the cleartext stream header. It is authenticated
@@ -172,7 +235,8 @@ func buildStreamHeader(salt []byte, chunkSize int, noncePrefix []byte) ([]byte, 
 		return nil, ErrInvalidChunkSize
 	}
 	if len(noncePrefix) != streamNoncePrefixSize {
-		return nil, ErrBadStream
+		// unreachable: the only caller passes randomBytes(streamNoncePrefixSize)
+		return nil, errStreamInvariant
 	}
 
 	header := make([]byte, streamHeaderSize)
@@ -288,6 +352,9 @@ func (s *Scheme) sealWriter(masterKey []byte, dst io.Writer, tag string, aad []b
 	chunkSize := s.chunkSize
 	if chunkSize < MinChunkSize || chunkSize > MaxChunkSize {
 		return nil, ErrInvalidChunkSize
+	}
+	if err := s.checkReadCeiling(); err != nil {
+		return nil, err
 	}
 
 	salt, err := GenerateSalt()
@@ -522,9 +589,22 @@ func (s *Scheme) OpenReaderAAD(masterKey []byte, src io.Reader, aad []byte) (*St
 	return s.openReader(masterKey, src, plainStreamTag, aad)
 }
 
+// checkReadCeiling validates Config.MaxAcceptedChunkSize, which like ChunkSize
+// is reported when a stream is created rather than at New.
+func (s *Scheme) checkReadCeiling() error {
+	if s.maxChunkSize < MinChunkSize || s.maxChunkSize > MaxChunkSize {
+		return ErrInvalidChunkSize
+	}
+	return nil
+}
+
 // openReader is [Scheme.OpenReaderAAD] over a chosen format tag; see
 // [Scheme.sealWriter] for why the tag is not part of the caller's AAD.
 func (s *Scheme) openReader(masterKey []byte, src io.Reader, tag string, aad []byte) (*StreamReader, error) {
+	if err := s.checkReadCeiling(); err != nil {
+		return nil, err
+	}
+
 	header := make([]byte, streamHeaderSize)
 	if _, err := io.ReadFull(src, header); err != nil {
 		// too short to be a stream; anything else is the caller's I/O error
@@ -537,6 +617,11 @@ func (s *Scheme) openReader(masterKey []byte, src io.Reader, tag string, aad []b
 	salt, chunkSize, prefix, err := parseStreamHeader(header)
 	if err != nil {
 		return nil, err
+	}
+	// The header is not authenticated yet, and the next step allocates what it
+	// asks for, so a Scheme that has named a tighter ceiling stops here.
+	if chunkSize > s.maxChunkSize {
+		return nil, ErrInvalidChunkSize
 	}
 
 	aead, err := s.streamAEAD(masterKey, salt)
@@ -613,7 +698,12 @@ func (r *StreamReader) WriteTo(dst io.Writer) (int64, error) {
 		r.plain = r.plain[n:]
 		total += int64(n)
 		if err != nil {
-			return total, err
+			// A failing dst ends the reader, as it does for PaddedReader: the
+			// rest of the stream cannot be delivered to a destination that has
+			// stopped accepting it, and ending here wipes the plaintext chunk
+			// still in the buffer instead of leaving it live for the GC.
+			r.fail(err)
+			return total, r.err
 		}
 		if short {
 			// io.Writer requires a non-nil error with a short write, so this

@@ -2,6 +2,7 @@ package envelope
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -146,4 +147,52 @@ func TestZero(t *testing.T) {
 	}
 
 	Zero(nil) // must not panic
+}
+
+// TestUnwrapKeyReportsAuthFailure pins the sentinel the documented rotation
+// check needs: "the KEK can no longer unwrap the stored master key" has to be
+// distinguishable from a corrupt blob and from a wrong-sized plaintext, and it
+// used to be an opaque string.
+func TestUnwrapKeyReportsAuthFailure(t *testing.T) {
+	s := Default()
+	kek, err := s.DeriveKEK(strings.Repeat("a", MinSecretLength))
+	if err != nil {
+		t.Fatalf("DeriveKEK error: %v", err)
+	}
+	rotated, err := s.DeriveKEK(strings.Repeat("b", MinSecretLength))
+	if err != nil {
+		t.Fatalf("DeriveKEK error: %v", err)
+	}
+
+	masterKey, err := GenerateMasterKey()
+	if err != nil {
+		t.Fatalf("GenerateMasterKey error: %v", err)
+	}
+	wrapped, err := WrapKey(kek, masterKey)
+	if err != nil {
+		t.Fatalf("WrapKey error: %v", err)
+	}
+
+	// the secret changed
+	if _, err := UnwrapKey(rotated, wrapped); !errors.Is(err, ErrEnvelopeAuth) {
+		t.Errorf("rotated secret: err = %v, want ErrEnvelopeAuth", err)
+	}
+	// the stored value was tampered with
+	bad := append([]byte{}, wrapped...)
+	bad[len(bad)-1] ^= 0xFF
+	if _, err := UnwrapKey(kek, bad); !errors.Is(err, ErrEnvelopeAuth) {
+		t.Errorf("tampered: err = %v, want ErrEnvelopeAuth", err)
+	}
+	// authentic but not a key: a different sentinel, so the two stay apart
+	notAKey, err := crypt.EncryptByteXChacha20poly1305WithNonceAppended(kek, []byte("short"))
+	if err != nil {
+		t.Fatalf("encrypt error: %v", err)
+	}
+	err = func() error { _, e := UnwrapKey(kek, notAKey); return e }()
+	if !errors.Is(err, ErrInvalidKeySize) {
+		t.Errorf("wrong-sized plaintext: err = %v, want ErrInvalidKeySize", err)
+	}
+	if errors.Is(err, ErrEnvelopeAuth) {
+		t.Error("a wrong-sized plaintext is not an authentication failure")
+	}
 }

@@ -98,7 +98,13 @@ func (s *Scheme) OpenBytesAAD(masterKey, blob, aad []byte) ([]byte, error) {
 	}
 	defer Zero(subKey)
 
-	return crypt.DecryptByteXChacha20poly1305WithNonceAppendedAAD(subKey, ciphertext, authData(header, aad))
+	plaintext, err := crypt.DecryptByteXChacha20poly1305WithNonceAppendedAAD(subKey, ciphertext, authData(header, aad))
+	if err != nil {
+		// One sentinel for every way authentication can fail, matching what
+		// readChunk does with ErrStreamAuth. Errors stay generic on purpose.
+		return nil, ErrEnvelopeAuth
+	}
+	return plaintext, nil
 }
 
 // SealString encrypts a plaintext string and returns the envelope as a standard

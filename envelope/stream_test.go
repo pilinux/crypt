@@ -517,8 +517,13 @@ func TestStreamHeaderCodec(t *testing.T) {
 		if _, err := buildStreamHeader(salt, MaxChunkSize+1, prefix); !errors.Is(err, ErrInvalidChunkSize) {
 			t.Errorf("big chunk: err = %v, want ErrInvalidChunkSize", err)
 		}
-		if _, err := buildStreamHeader(salt, DefaultChunkSize, prefix[:4]); !errors.Is(err, ErrBadStream) {
-			t.Errorf("short prefix: err = %v, want ErrBadStream", err)
+		// a bad prefix length is this package's own bug, not bad input, so it
+		// reports the invariant rather than ErrBadStream
+		if _, err := buildStreamHeader(salt, DefaultChunkSize, prefix[:4]); !errors.Is(err, errStreamInvariant) {
+			t.Errorf("short prefix: err = %v, want errStreamInvariant", err)
+		}
+		if _, err := buildStreamHeader(salt, DefaultChunkSize, prefix[:4]); errors.Is(err, ErrBadStream) {
+			t.Error("short prefix must not report ErrBadStream, which names untrusted input")
 		}
 	})
 
@@ -928,3 +933,140 @@ func TestStreamReaderWriteToRejectsBadWriters(t *testing.T) {
 type badWriter struct{ n func(size int) int }
 
 func (b badWriter) Write(p []byte) (int, error) { return b.n(len(p)), nil }
+
+// TestWriteToDestinationErrorIsSticky pins that a failing destination ends the
+// reader rather than leaving it usable. It used to return the error without
+// recording it, so a caller could keep reading plaintext out of a stream whose
+// delivery had already failed, and the chunk still in the buffer was never
+// wiped.
+func TestWriteToDestinationErrorIsSticky(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	sealed, _ := seal(t, s, masterKey, 3*testChunkSize, nil)
+
+	r, err := s.OpenReader(masterKey, bytes.NewReader(sealed))
+	if err != nil {
+		t.Fatalf("OpenReader error: %v", err)
+	}
+	if _, err := r.WriteTo(&failWriterAfter{ok: 0}); !errors.Is(err, errWriteFailed) {
+		t.Fatalf("WriteTo: err = %v, want the destination error", err)
+	}
+
+	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, errWriteFailed) {
+		t.Errorf("Read after a failed destination: err = %v, want the sticky error", err)
+	}
+	if _, err := r.WriteTo(io.Discard); !errors.Is(err, errWriteFailed) {
+		t.Errorf("WriteTo again: err = %v, want the sticky error", err)
+	}
+	for _, b := range r.buf {
+		if b != 0 {
+			t.Fatal("the plaintext chunk was left in the buffer")
+		}
+	}
+}
+
+// TestMaxAcceptedChunkSize pins the reader ceiling. The header is read before
+// anything authenticates and the reader allocates what it names, so a Scheme
+// must be able to refuse a chunk size larger than it ever writes.
+func TestMaxAcceptedChunkSize(t *testing.T) {
+	masterKey := newMasterKey(t)
+	wide := New(Config{ChunkSize: 4 * MinChunkSize})
+	sealed, payload := seal(t, wide, masterKey, 5*MinChunkSize, nil)
+
+	t.Run("refusesAWiderStream", func(t *testing.T) {
+		strict := New(Config{MaxAcceptedChunkSize: MinChunkSize})
+		if _, err := strict.OpenStream(masterKey, io.Discard, bytes.NewReader(sealed)); !errors.Is(err, ErrInvalidChunkSize) {
+			t.Errorf("err = %v, want ErrInvalidChunkSize", err)
+		}
+		// and refuses it before allocating for it, i.e. from the header alone
+		if _, err := strict.OpenReader(masterKey, bytes.NewReader(sealed[:StreamHeaderSize])); !errors.Is(err, ErrInvalidChunkSize) {
+			t.Errorf("header only: err = %v, want ErrInvalidChunkSize", err)
+		}
+	})
+
+	t.Run("acceptsAtTheCeiling", func(t *testing.T) {
+		exact := New(Config{MaxAcceptedChunkSize: 4 * MinChunkSize})
+		var out bytes.Buffer
+		if _, err := exact.OpenStream(masterKey, &out, bytes.NewReader(sealed)); err != nil {
+			t.Fatalf("OpenStream error: %v", err)
+		}
+		if !bytes.Equal(out.Bytes(), payload) {
+			t.Error("payload did not round-trip at the ceiling")
+		}
+	})
+
+	t.Run("defaultsToMaxChunkSize", func(t *testing.T) {
+		if New(Config{}).maxChunkSize != MaxChunkSize {
+			t.Error("an unset ceiling must default to MaxChunkSize")
+		}
+		var out bytes.Buffer
+		if _, err := Default().OpenStream(masterKey, &out, bytes.NewReader(sealed)); err != nil {
+			t.Errorf("the default ceiling refused an ordinary stream: %v", err)
+		}
+	})
+
+	t.Run("outOfRangeIsReportedAtStreamCreation", func(t *testing.T) {
+		for _, n := range []int{MinChunkSize - 1, MaxChunkSize + 1, -1} {
+			bad := New(Config{MaxAcceptedChunkSize: n})
+			if _, err := bad.OpenReader(masterKey, bytes.NewReader(sealed)); !errors.Is(err, ErrInvalidChunkSize) {
+				t.Errorf("ceiling %d on open: err = %v, want ErrInvalidChunkSize", n, err)
+			}
+			if _, err := bad.SealWriter(masterKey, io.Discard); !errors.Is(err, ErrInvalidChunkSize) {
+				t.Errorf("ceiling %d on seal: err = %v, want ErrInvalidChunkSize", n, err)
+			}
+		}
+	})
+}
+
+// TestPlaintextLenInvertsSealedSize pins the exported inversion the example
+// used to carry by hand, along with the header size it needed to do the
+// arithmetic at all.
+func TestPlaintextLenInvertsSealedSize(t *testing.T) {
+	if StreamHeaderSize != 2+SaltSize+4+(NonceSize-9) {
+		t.Fatalf("StreamHeaderSize = %d, does not match the field layout", StreamHeaderSize)
+	}
+
+	t.Run("everySizeRoundTrips", func(t *testing.T) {
+		for _, cs := range []int{MinChunkSize, 4096, DefaultChunkSize} {
+			for _, n := range []int64{0, 1, int64(cs) - 1, int64(cs), int64(cs) + 1, 3*int64(cs) + 7} {
+				chunks := n/int64(cs) + 1
+				if n > 0 && n%int64(cs) == 0 {
+					chunks = n / int64(cs)
+				}
+				sealed := StreamHeaderSize + n + TagSize*chunks
+				got, ok := PlaintextLen(sealed, cs)
+				if !ok || got != n {
+					t.Errorf("chunk %d, n %d: got (%d, %v)", cs, n, got, ok)
+				}
+			}
+		}
+	})
+
+	// what the example actually does: seal, then recover the length from the
+	// sealed size with nothing else recorded
+	t.Run("matchesARealStream", func(t *testing.T) {
+		s := streamScheme()
+		masterKey := newMasterKey(t)
+		for _, n := range []int{0, 1, testChunkSize, 3*testChunkSize + 7} {
+			sealed, _ := seal(t, s, masterKey, n, nil)
+			got, ok := PlaintextLen(int64(len(sealed)), testChunkSize)
+			if !ok || got != int64(n) {
+				t.Errorf("n %d: got (%d, %v) from %d sealed bytes", n, got, ok, len(sealed))
+			}
+		}
+	})
+
+	t.Run("rejectsWhatCannotBeAStream", func(t *testing.T) {
+		for _, sealed := range []int64{0, 1, StreamHeaderSize, StreamHeaderSize + TagSize - 1, -100} {
+			if _, ok := PlaintextLen(sealed, MinChunkSize); ok {
+				t.Errorf("sealed %d was accepted", sealed)
+			}
+		}
+		if _, ok := PlaintextLen(1<<20, MinChunkSize-1); ok {
+			t.Error("an out-of-range chunk size was accepted")
+		}
+		if _, ok := PlaintextLen(1<<20, MaxChunkSize+1); ok {
+			t.Error("an out-of-range chunk size was accepted")
+		}
+	})
+}
