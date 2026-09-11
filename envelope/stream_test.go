@@ -934,6 +934,71 @@ type badWriter struct{ n func(size int) int }
 
 func (b badWriter) Write(p []byte) (int, error) { return b.n(len(p)), nil }
 
+// afterHeaderWriter passes the stream header through untouched and misreports
+// every write after it, so the chunk path is reached with a StreamWriter in
+// hand rather than failing at SealWriter.
+type afterHeaderWriter struct {
+	n    func(size int) int
+	seen bool
+}
+
+func (a *afterHeaderWriter) Write(p []byte) (int, error) {
+	if !a.seen {
+		a.seen = true
+		return len(p), nil
+	}
+	return a.n(len(p)), nil
+}
+
+// TestSealWriterRejectsBadDestinations is the write-side twin of
+// TestStreamReaderWriteToRejectsBadWriters. The reader half checked the count
+// its destination reported and the writer half did not, so a destination that
+// quietly dropped bytes produced an incomplete stream that Close called a
+// success: the one verdict a caller acts on by discarding the plaintext.
+func TestSealWriterRejectsBadDestinations(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	plaintext := bytes.Repeat([]byte("A"), 4*testChunkSize)
+
+	tests := []struct {
+		name string
+		n    func(size int) int
+		want error
+	}{
+		{name: "overCounting", n: func(l int) int { return l + 1 }, want: errBadWriteCount},
+		{name: "negativeCount", n: func(int) int { return -1 }, want: errBadWriteCount},
+		{name: "shortWithNoError", n: func(l int) int { return l / 2 }, want: io.ErrShortWrite},
+		{name: "writesNothing", n: func(int) int { return 0 }, want: io.ErrShortWrite},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+"/header", func(t *testing.T) {
+			// the header is the first write, so a destination this broken is
+			// caught before a StreamWriter is handed out at all
+			if _, err := s.SealWriter(masterKey, badWriter{n: tt.n}); !errors.Is(err, tt.want) {
+				t.Errorf("SealWriter over a bad destination: err = %v, want %v", err, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"/chunk", func(t *testing.T) {
+			dst := &afterHeaderWriter{n: tt.n}
+			w, err := s.SealWriter(masterKey, dst)
+			if err != nil {
+				t.Fatalf("SealWriter error: %v", err)
+			}
+
+			_, err = io.Copy(w, bytes.NewReader(plaintext))
+			if !errors.Is(err, tt.want) {
+				t.Errorf("io.Copy: err = %v, want %v", err, tt.want)
+			}
+			// the verdict is the point: Close must not call an incomplete
+			// stream complete, since a nil here licenses dropping the source
+			if err := w.Close(); !errors.Is(err, tt.want) {
+				t.Errorf("Close after a lossy destination: err = %v, want the sticky %v", err, tt.want)
+			}
+		})
+	}
+}
+
 // TestWriteToDestinationErrorIsSticky pins that a failing destination ends the
 // reader rather than leaving it usable. It used to return the error without
 // recording it, so a caller could keep reading plaintext out of a stream whose

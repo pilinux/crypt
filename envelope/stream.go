@@ -289,6 +289,28 @@ func streamNonce(dst, noncePrefix []byte, counter uint64, final bool) {
 	}
 }
 
+// writeAll writes p to dst and checks the count the way io.Copy does.
+// dst is caller-supplied: a count outside 0..len(p) is errBadWriteCount, and a
+// short write reported with a nil error is io.ErrShortWrite.
+//
+// Without this a destination that quietly drops bytes lets Close report
+// success for a stream whose ciphertext is incomplete, which is the one
+// verdict a caller acts on by discarding the plaintext. It is the write-side
+// twin of the check StreamReader.WriteTo makes on its destination.
+func writeAll(dst io.Writer, p []byte) error {
+	n, err := dst.Write(p)
+	if err != nil {
+		return err
+	}
+	if n < 0 || n > len(p) {
+		return errBadWriteCount
+	}
+	if n < len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
 // streamAEAD derives the per-stream sub-key from the master key and salt and
 // turns it into a reusable AEAD. The sub-key copy is wiped immediately; the
 // AEAD keeps its own, unreachable copy for the lifetime of the stream.
@@ -374,7 +396,7 @@ func (s *Scheme) sealWriter(masterKey []byte, dst io.Writer, tag string, aad []b
 	if err != nil {
 		return nil, err
 	}
-	if _, err := dst.Write(header); err != nil {
+	if err := writeAll(dst, header); err != nil {
 		return nil, err
 	}
 
@@ -536,7 +558,7 @@ func (w *StreamWriter) seal(final bool) error {
 	streamNonce(w.nonce[:], w.prefix, w.counter, final)
 
 	chunk := w.aead.Seal(w.buf[:0], w.nonce[:], w.buf[:w.n], w.aad)
-	if _, err := w.dst.Write(chunk); err != nil {
+	if err := writeAll(w.dst, chunk); err != nil {
 		return w.fail(err)
 	}
 
