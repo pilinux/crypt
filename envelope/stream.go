@@ -26,6 +26,7 @@ package envelope
 //	  Read / WriteTo
 //	   -> readChunk         streamNonce -> aead.Open(buf[:0]); fail wipes buf
 //	                        and makes the error sticky
+//	  Abort                ends a reader early through fail
 
 import (
 	"crypto/cipher"
@@ -207,11 +208,11 @@ var (
 	ErrStreamClosed = errors.New("envelope: stream writer is closed")
 
 	// ErrStreamAborted is returned by [StreamWriter.Close] and the write
-	// methods after [StreamWriter.Abort] discarded the stream. It says the
-	// destination holds a deliberate fragment, not a failure: nothing is wrong
-	// with the bytes that were written, there just is no final chunk and never
-	// will be.
-	ErrStreamAborted = errors.New("envelope: stream writer was aborted")
+	// methods after [StreamWriter.Abort] discarded the stream, and by the read
+	// methods after [StreamReader.Abort] ended it. It says the stream was
+	// abandoned on purpose, not that anything is wrong with it: for a writer
+	// the destination holds a fragment with no final chunk, and never will.
+	ErrStreamAborted = errors.New("envelope: stream was aborted")
 
 	// errBadWriteCount: a destination returned a count outside 0..len(p),
 	// breaking the io.Writer contract. Unexported for the same reason io.Copy
@@ -785,10 +786,22 @@ func (r *StreamReader) readChunk() error {
 	return nil
 }
 
+// Abort ends the reader early: the decrypted plaintext it still holds is wiped
+// and every later call reports [ErrStreamAborted]. It is for a caller that
+// stops before the end, such as a download whose client went away, which would
+// otherwise leave up to a chunk of plaintext on the heap until the reader is
+// collected.
+func (r *StreamReader) Abort() {
+	r.fail(ErrStreamAborted)
+}
+
 // fail records the terminal state (io.EOF for a clean end) and wipes the
-// plaintext left in the buffer.
+// plaintext left in the buffer. Only the first error counts, as in
+// StreamWriter.fail; the wipe happens on every call.
 func (r *StreamReader) fail(err error) {
-	r.err = err
+	if r.err == nil {
+		r.err = err
+	}
 	r.plain = nil
 	Zero(r.buf)
 }

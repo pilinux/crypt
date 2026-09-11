@@ -202,6 +202,7 @@ _, err = io.Copy(sw, src)
 err = sw.Close() // seals the final chunk; the stream is only complete after this
 
 sr, err := scheme.OpenReader(masterKey, src) // io.Reader
+defer sr.Abort()                             // wipes the held chunk if you stop early
 _, err = io.Copy(dst, sr)
 ```
 
@@ -313,7 +314,7 @@ independently; use `RandomHex` names if that matters.
 | RSA-OAEP (`rsa.go`) | `Encoder.EncryptRSA` / `Decoder.DecryptRSA` (+ `Byte` variants) |
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
 | Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
-| Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader`/`StreamWriter.Abort` (+ `AAD` variants), `StreamHeaderSize`, `PlaintextLen` |
+| Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader`/`StreamWriter.Abort`/`StreamReader.Abort` (+ `AAD` variants), `StreamHeaderSize`, `PlaintextLen` |
 | Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream` (+ `AAD` variants), `PaddedSize` |
 
 The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
@@ -405,6 +406,8 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   that quit part-way cannot be closed into a valid short stream. Use
   `StreamWriter.Abort` for the case nothing failed and you simply do not want
   the stream: `defer sw.Abort()` costs nothing once `Close` has succeeded.
+  `StreamReader.Abort` is the reading half: stop before the end and it wipes
+  the decrypted chunk the reader still holds.
 - **Ciphertext reveals its plaintext length.** Both formats store enough in the
   clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
   for a stream. Content, key and context stay hidden, but size alone can

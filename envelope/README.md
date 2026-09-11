@@ -654,7 +654,7 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `ErrBadStream`: bad header, or a chunk too short to hold a tag.
 - `ErrStreamAuth`: chunk failed authentication. Wrong key or aad, modified data, or chunks reordered, duplicated, dropped or truncated.
 - `ErrStreamClosed`: `Write` after a clean `Close`. A writer that failed or was aborted reports what ended it instead.
-- `ErrStreamAborted`: `Close` or a write method after `Abort` discarded the stream. It says the fragment on `dst` was abandoned on purpose, not that anything went wrong with it.
+- `ErrStreamAborted`: `Close` or a write method after `StreamWriter.Abort` discarded the stream, or a read method after `StreamReader.Abort` ended it. It says the stream was abandoned on purpose (for a writer, the fragment on `dst`), not that anything went wrong with it.
 
 ### Header and nonce helpers
 
@@ -687,7 +687,8 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `(*StreamReader) Read(p)`: serve from `plain`, decrypting the next chunk when it runs out. A stream that ends without an authentic final chunk fails with `ErrStreamAuth`, not a clean EOF.
 - `(*StreamReader) WriteTo(dst)`: the `io.Copy` fast path, draining a whole chunk at a time. `dst` is caller-supplied, so its reported count is checked the way `io.Copy` checks it: a count outside `0..len(p)` ends the reader, and a short write with no error is `io.ErrShortWrite` rather than another trip round the loop.
 - `(*StreamReader) readChunk()`: carry byte plus `io.ReadFull` → one-byte look-ahead decides `final` → `streamNonce` → `aead.Open(buf[:0], ...)` in place. Any failure is `ErrStreamAuth`.
-- `(*StreamReader) fail(err)`: record the terminal state (`io.EOF` means clean) and wipe the buffer.
+- `(*StreamReader) Abort()`: end the reader early, for a caller that stops before the end: `fail(ErrStreamAborted)`, which wipes `buf` so up to a chunk of decrypted plaintext does not stay on the heap until the reader is collected. It does not touch `src`, and a reader that already reported `io.EOF` or an error keeps that verdict, so `defer r.Abort()` is safe. Not named `Close`, so the type does not become an `io.ReadCloser` that plumbing might close `src` through.
+- `(*StreamReader) fail(err)`: record the terminal state (`io.EOF` means clean) and wipe the buffer. First error wins, as in the writer; the wipe runs on every call.
 
 ### One-shot stream helpers
 

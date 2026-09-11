@@ -870,6 +870,81 @@ func TestStreamWriterAbort(t *testing.T) {
 	})
 }
 
+// TestStreamReaderAbort pins the reader's early exit. Without it a caller that
+// stops part-way leaves a chunk of decrypted plaintext on the heap until the
+// reader is collected.
+func TestStreamReaderAbort(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	sealed, payload := seal(t, s, masterKey, 3*testChunkSize, nil)
+
+	t.Run("wipesAMidwayReader", func(t *testing.T) {
+		src := bytes.NewReader(sealed)
+		r, err := s.OpenReader(masterKey, src)
+		if err != nil {
+			t.Fatalf("OpenReader error: %v", err)
+		}
+		p := make([]byte, 8)
+		if _, err := io.ReadFull(r, p); err != nil {
+			t.Fatalf("Read error: %v", err)
+		}
+		if !bytes.Equal(r.buf[:testChunkSize], payload[:testChunkSize]) {
+			t.Fatal("precondition: chunk 0 plaintext should be in the buffer")
+		}
+
+		left := src.Len()
+		r.Abort()
+
+		for _, b := range r.buf {
+			if b != 0 {
+				t.Fatal("Abort left plaintext in the buffer")
+			}
+		}
+		if src.Len() != left {
+			t.Error("Abort read from the source")
+		}
+		if _, err := r.Read(p); !errors.Is(err, ErrStreamAborted) {
+			t.Errorf("Read after Abort: err = %v, want ErrStreamAborted", err)
+		}
+		if _, err := r.WriteTo(io.Discard); !errors.Is(err, ErrStreamAborted) {
+			t.Errorf("WriteTo after Abort: err = %v, want ErrStreamAborted", err)
+		}
+	})
+
+	// the `defer r.Abort()` shape: it must not rewrite a clean end
+	t.Run("noOpAfterACleanEnd", func(t *testing.T) {
+		r, err := s.OpenReader(masterKey, bytes.NewReader(sealed))
+		if err != nil {
+			t.Fatalf("OpenReader error: %v", err)
+		}
+		out, err := io.ReadAll(r)
+		if err != nil || !bytes.Equal(out, payload) {
+			t.Fatalf("ReadAll: err = %v, payload match = %v", err, bytes.Equal(out, payload))
+		}
+		r.Abort()
+		if _, err := r.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Errorf("Read after Abort: err = %v, want io.EOF", err)
+		}
+	})
+
+	// an earlier failure is the more useful verdict, so Abort must not mask it
+	t.Run("keepsAnEarlierError", func(t *testing.T) {
+		tampered := bytes.Clone(sealed)
+		tampered[len(tampered)-1] ^= 1
+		r, err := s.OpenReader(masterKey, bytes.NewReader(tampered))
+		if err != nil {
+			t.Fatalf("OpenReader error: %v", err)
+		}
+		if _, err := io.Copy(io.Discard, r); !errors.Is(err, ErrStreamAuth) {
+			t.Fatalf("io.Copy: err = %v, want ErrStreamAuth", err)
+		}
+		r.Abort()
+		if _, err := r.Read(make([]byte, 1)); !errors.Is(err, ErrStreamAuth) {
+			t.Errorf("Read after Abort: err = %v, want the earlier ErrStreamAuth", err)
+		}
+	})
+}
+
 // failWriterAfter accepts ok writes and fails from then on.
 type failWriterAfter struct{ ok int }
 
