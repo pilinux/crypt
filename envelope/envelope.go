@@ -215,10 +215,10 @@ type Config struct {
 	// per concurrent open. A deployment that only ever writes 1 MiB chunks can
 	// say so here and turn that into [ErrInvalidChunkSize].
 	//
-	// Keep it at or above the ChunkSize you seal with. Set it any lower and
-	// your own streams stop opening, which is a quiet way to lock yourself out
-	// of your data; that is why the default is the widest size the format
-	// allows rather than the chunk size you happen to write today.
+	// Set it at or above the ChunkSize of every writer whose streams you open;
+	// larger chunks fail with [ErrInvalidChunkSize]. For the same reason, a
+	// Scheme refuses to seal if its own ChunkSize is above it. That is why the
+	// default is [MaxChunkSize].
 	MaxAcceptedChunkSize int
 }
 

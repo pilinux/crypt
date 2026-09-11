@@ -650,7 +650,7 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `StreamHeaderSize` = 37: the cleartext header every stream begins with, exported so callers can do the format's size arithmetic without copying the constant.
 - `streamVersion` = `0x81`: high bit set so it can never collide with `envelopeVersion`, and each reader rejects the other's blob up front.
 - `streamNoncePrefixSize` = 15, `streamCounterSize` = 8, `streamChunkSizeWidth` = 4, `streamHeaderSize` = 37.
-- `ErrInvalidChunkSize`: chunk size outside `MinChunkSize`..`MaxChunkSize`, whether it came from `Config.ChunkSize`, from `Config.MaxAcceptedChunkSize`, or from a stream header that exceeds the ceiling this `Scheme` accepts.
+- `ErrInvalidChunkSize`: chunk size outside `MinChunkSize`..`MaxChunkSize`, whether it came from `Config.ChunkSize`, from `Config.MaxAcceptedChunkSize`, or from a stream header that exceeds the ceiling this `Scheme` accepts; also a seal whose `Config.ChunkSize` exceeds that same ceiling, since the `Scheme` could never open what it wrote.
 - `ErrBadStream`: bad header, or a chunk too short to hold a tag.
 - `ErrStreamAuth`: chunk failed authentication. Wrong key or aad, modified data, or chunks reordered, duplicated, dropped or truncated.
 - `ErrStreamClosed`: `Write` after a clean `Close`. A writer that failed or was aborted reports what ended it instead.
@@ -661,7 +661,7 @@ Chunked STREAM construction for input that does not fit in memory. One sub-key p
 - `buildStreamHeader(salt, chunkSize, noncePrefix)`: assemble the 37-byte cleartext header, validating all three inputs.
 - `parseStreamHeader(header)`: validate and split it back into salt, chunk size and nonce prefix (aliasing `header`). The chunk size always comes from the stream, never from the `Scheme`, so changing `Config.ChunkSize` never orphans data. `openReader` then checks it against `Config.MaxAcceptedChunkSize` before allocating, since nothing is authenticated yet at that point.
 - `PlaintextLen(sealed, chunkSize)`: invert `StreamHeaderSize + n + TagSize*ceil(n/chunkSize)` to recover `n` from a sealed size, reporting false when no length produces that size. The answer is unique because the chunk count never falls as `n` grows, and the search is a couple of candidates whatever the size. It inverts the **unpadded** format; on a padded stream it returns the padded length, not the payload length the padding exists to hide.
-- `checkReadCeiling()`: validate `Config.MaxAcceptedChunkSize`, reported when a stream is created rather than at `New`, exactly as `ChunkSize` is.
+- `checkReadCeiling()`: validate `Config.MaxAcceptedChunkSize`, reported when a stream is created rather than at `New`, exactly as `ChunkSize` is. It does not compare the two: it runs on open too, where a `ChunkSize` above the ceiling is legitimate, so that check lives in `sealWriter`.
 - `streamNonce(dst, prefix, counter, final)`: `prefix(15) || counter(8 BE) || finalFlag(1)`. The counter pins a chunk to its position and the flag marks the last one, which is what makes reorder, duplicate, drop and truncate authentication failures.
 - `(*Scheme) streamAEAD(masterKey, salt)`: `DeriveSubKey` → one long-lived `chacha20poly1305.NewX` AEAD. The local sub-key copy is wiped immediately.
 

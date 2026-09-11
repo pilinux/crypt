@@ -378,6 +378,10 @@ func (s *Scheme) sealWriter(masterKey []byte, dst io.Writer, tag string, aad []b
 	if err := s.checkReadCeiling(); err != nil {
 		return nil, err
 	}
+	// This Scheme could never open a stream wider than its own ceiling.
+	if chunkSize > s.maxChunkSize {
+		return nil, ErrInvalidChunkSize
+	}
 
 	salt, err := GenerateSalt()
 	if err != nil {

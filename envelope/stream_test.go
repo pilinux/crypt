@@ -1081,6 +1081,24 @@ func TestMaxAcceptedChunkSize(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("sealRefusesAChunkSizeAboveItsOwnCeiling", func(t *testing.T) {
+		// such a Scheme would seal streams it can never open
+		locked := New(Config{ChunkSize: 4 * MinChunkSize, MaxAcceptedChunkSize: MinChunkSize})
+		if _, err := locked.SealWriter(masterKey, io.Discard); !errors.Is(err, ErrInvalidChunkSize) {
+			t.Errorf("SealWriter: err = %v, want ErrInvalidChunkSize", err)
+		}
+		// the comparison is seal-only: a reader whose own ChunkSize exceeds its
+		// ceiling still opens a stream inside that ceiling
+		narrow, payload := seal(t, New(Config{ChunkSize: MinChunkSize}), masterKey, 3*MinChunkSize, nil)
+		var out bytes.Buffer
+		if _, err := locked.OpenStream(masterKey, &out, bytes.NewReader(narrow)); err != nil {
+			t.Fatalf("OpenStream error: %v", err)
+		}
+		if !bytes.Equal(out.Bytes(), payload) {
+			t.Error("payload did not round-trip")
+		}
+	})
 }
 
 // TestPlaintextLenInvertsSealedSize pins the exported inversion the example
