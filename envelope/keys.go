@@ -11,7 +11,7 @@ import (
 // secret using HKDF-SHA256 with the Scheme's KEK label.
 //
 // The secret must be machine-generated randomness of at least
-// [MinSecretLength] characters (e.g. the output of `openssl rand -hex 32`),
+// [MinSecretLength] bytes (e.g. the output of `openssl rand -hex 32`),
 // never a human-chosen passphrase: the derivation is plain HKDF with no
 // password stretching, so a guessable secret can be brute-forced offline by
 // anyone holding the wrapped master key.

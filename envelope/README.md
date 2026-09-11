@@ -41,7 +41,7 @@ Both formats share one key ladder. Only the leaf key ever touches user data.
 
 | Value | Size | Produced by | Lives where |
 | --- | --- | --- | --- |
-| Application secret | >= 32 chars (`MinSecretLength`) | your own randomness, e.g. `openssl rand -hex 32` | env var / secret manager, never on the wire |
+| Application secret | >= 32 bytes (`MinSecretLength`) | your own randomness, e.g. `openssl rand -hex 32` | env var / secret manager, never on the wire |
 | KEK | 32 (`KeySize`) | `HKDF-SHA256(ikm = secret, salt = nil, info = KEKLabel)` | memory only, `Zero` it after wrapping |
 | Master key (DEK) | 32 | `crypto/rand`, generated once ever | stored *wrapped*, see [1](#1-wrapped-master-key-at-rest) |
 | Per-item sub-key | 32 | `HKDF-SHA256(ikm = masterKey, salt = 16-byte item salt, info = SubKeyLabel)` | memory only, wiped on return (`defer Zero`) |
@@ -603,7 +603,7 @@ which of the three reasons it was.
 
 The outer layer: secret to KEK to wrapped master key.
 
-- `(*Scheme) DeriveKEK(secret string)`: HKDF-SHA256 (nil salt, KEK label) to a 32-byte KEK. Rejects a secret under 32 chars. Deterministic, so a rotated secret shows up as an unwrap failure. Wipe with `Zero` after use.
+- `(*Scheme) DeriveKEK(secret string)`: HKDF-SHA256 (nil salt, KEK label) to a 32-byte KEK. Rejects a secret under 32 bytes. Deterministic, so a rotated secret shows up as an unwrap failure. Wipe with `Zero` after use.
 - `GenerateMasterKey()`: 32 random bytes (DEK). Called once, ever.
 - `WrapKey(kek, masterKey)`: `crypt.EncryptByteXChacha20poly1305WithNonceAppended(kek, masterKey)`, both args length-checked. This is what gets stored at rest.
 - `UnwrapKey(kek, wrapped)`: the reverse. A non-nil error means a wrong KEK (secret changed), tampering, or an authentic plaintext that is not 32 bytes, which is wiped before returning `ErrInvalidKeySize`.

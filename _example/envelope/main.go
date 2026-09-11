@@ -71,7 +71,7 @@ func main() {
 	}
 
 	// The application secret, typically read from an env var such as
-	// ENCRYPTION_SECRET. It must be at least envelope.MinSecretLength chars of
+	// ENCRYPTION_SECRET. It must be at least envelope.MinSecretLength bytes of
 	// machine-generated randomness (e.g. `openssl rand -hex 32`), never a
 	// human-chosen passphrase: DeriveKEK applies no password stretching.
 	secret := "0123456789abcdef0123456789abcdef01234567"

@@ -154,7 +154,7 @@ func main() {
 	// Bootstrap: derive a key-encryption key (KEK) from a rotatable secret,
 	// then generate a master key and store it *wrapped*. (Errors omitted
 	// for brevity; handle them in real code.)
-	// The secret must be machine-generated randomness, >= 32 chars
+	// The secret must be machine-generated randomness, >= 32 bytes
 	// (e.g. `openssl rand -hex 32`), never a human-chosen passphrase.
 	kek, _ := scheme.DeriveKEK(os.Getenv("ENCRYPTION_SECRET"))
 	masterKey, _ := envelope.GenerateMasterKey()
