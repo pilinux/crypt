@@ -245,9 +245,12 @@ _, err = scheme.OpenPaddedFileAAD(masterKey, "doc.out", "doc.enc", []byte("doc")
 // Anything else: an io.Reader plus its length. Nothing is staged on disk.
 _, err = scheme.SealPaddedStream(masterKey, w, r, size) // io.Writer <- io.Reader
 _, err = scheme.OpenPaddedStream(masterKey, w, r)
+
+// No length, but a seekable destination such as an *os.File.
+_, err = scheme.SealPaddedAt(masterKey, f, r) // io.WriterAt <- io.Reader
 ```
 
-Both produce the same format, so a padded blob sealed one way opens the other.
+All three produce the same format, so a padded blob sealed one way opens the other.
 Padding costs no memory: the frame, the payload and the zero padding are pulled
 through the chunk sealer as it asks for them, so a padded 10 GB upload is
 sealed on the fly exactly like an unpadded one. The length is the one thing
@@ -266,6 +269,7 @@ discarding it, so truncation inside the padding still fails.
 
 **When the length is not knowable up front**, as with an HTML multipart upload
 (no per-part `Content-Length`, and the file is chosen after the page loads),
+write it into a file with `SealPaddedAt`, or, when the destination cannot seek,
 seal it unpadded and pad it afterwards:
 
 ```go
@@ -315,7 +319,7 @@ independently; use `RandomHex` names if that matters.
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
 | Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
 | Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader`/`StreamWriter.Abort`/`StreamReader.Abort` (+ `AAD` variants), `StreamHeaderSize`, `PlaintextLen` |
-| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream` (+ `AAD` variants), `PaddedSize` |
+| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream`, `SealPaddedAt` (+ `AAD` variants), `PaddedSize` |
 
 The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
 `...AAD` forms that bind caller-supplied associated data (authenticated, not
@@ -412,8 +416,9 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
   for a stream. Content, key and context stay hidden, but size alone can
   identify a known file. Use `SealPaddedFile` for files and
-  `SealPaddedStream` for everything else, or seal unpadded and pad in a second
-  pass when the length is not known up front; `SealInt64` is already
+  `SealPaddedStream` for everything else; when the length is not known up
+  front, use `SealPaddedAt` into a file, or seal unpadded and pad in a second
+  pass; `SealInt64` is already
   fixed-width, and other tokens need padding before you seal them.
 - **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
   private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after

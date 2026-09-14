@@ -1,0 +1,1203 @@
+<!doctype html>
+<meta charset="utf-8" />
+<!--
+  Source of envelope-flow.png, the diagram embedded in envelope/README.md.
+
+  Re-render after editing (macOS, Chrome; any headless Chromium works). The
+  page is laid out for exactly 1680x1996 CSS pixels and captured at 2x, so the
+  PNG stays 3360x3992:
+
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        --headless=new --disable-gpu --hide-scrollbars \
+        --force-device-scale-factor=2 --window-size=1680,1996 \
+        --screenshot=envelope/envelope-flow.png \
+        "file://$PWD/envelope/envelope-flow.html"
+
+  Notes for editors:
+
+  - Positions are absolute and in CSS pixels, measured from the design this
+    file reproduces; the type scale (odd sizes such as 11.7px and 18.6px) was
+    calibrated against it too. Nudge a value rather than reflowing a section.
+  - Body copy is hard-wrapped with <br> on purpose: the line breaks are part of
+    the composition, not the result of a container width.
+  - Every byte count, API name and format detail here is asserted by the code
+    in this package. Check the diagram whenever the wire format, the API
+    surface or the AAD binding changes, the way README.md is checked.
+  - Fonts are Helvetica Neue and Menlo, both stock on macOS. Rendering
+    elsewhere will reflow the text.
+-->
+<title>Envelope encryption, end to end</title>
+<style>
+  :root {
+    --sky: #3fbef7;
+    --emerald: #34d399;
+    --violet: #a78bfa;
+    --amber: #f5b23f;
+    --rose: #fb7185;
+    --ink: #eaf0fa;
+    --muted: #93a2bc;
+    --dim: #63728c;
+    --sans: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --mono: "SF Mono", SFMono-Regular, Menlo, monospace;
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+  }
+
+  .page {
+    position: relative;
+    width: 1680px;
+    height: 1996px;
+    overflow: hidden;
+    background:
+      radial-gradient(
+        1300px 1000px at 50% -60px,
+        #1e2c4e 0%,
+        rgba(12, 19, 36, 0) 70%
+      ),
+      linear-gradient(180deg, #101a2f 0%, #0b1222 45%, #0a1020 100%);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .a {
+    position: absolute;
+  }
+
+  /* ---------- type ---------- */
+  .mono {
+    font-family: var(--mono);
+  }
+  .h1 {
+    font-size: 41.2px;
+    font-weight: 700;
+    color: var(--ink);
+    letter-spacing: -0.4px;
+    line-height: 44px;
+  }
+  .lede {
+    font-size: 16.8px;
+    color: var(--muted);
+    line-height: 22px;
+  }
+  .kicker {
+    font-family: var(--mono);
+    font-size: 11.7px;
+    color: var(--dim);
+    line-height: 16px;
+  }
+  .h2 {
+    font-size: 24.3px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 28px;
+  }
+  .h2sub {
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 18px;
+  }
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1.85px;
+    line-height: 16px;
+    text-transform: uppercase;
+  }
+  .note-right {
+    font-size: 12.4px;
+    color: #4e5b75;
+    line-height: 16px;
+  }
+
+  .rule {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .badge {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  /* ---------- cards ---------- */
+  .bar {
+    height: 4px;
+    border-radius: 999px;
+    opacity: 0.8;
+  }
+  .card {
+    box-sizing: border-box;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 8px;
+    background: linear-gradient(180deg, #20273b 0%, #171f31 100%);
+  }
+  .panel {
+    box-sizing: border-box;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    background: linear-gradient(180deg, #1b2333 0%, #12192a 100%);
+  }
+  .card-title {
+    font-size: 18.6px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 22px;
+  }
+  .card-mono {
+    font-family: var(--mono);
+    font-size: 11.7px;
+    line-height: 16px;
+  }
+  .card-body {
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 18px;
+  }
+
+  /* ---------- ladder arrows ---------- */
+  .alabel {
+    font-size: 11.8px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+  }
+  .alabel-dim {
+    font-size: 11.8px;
+    font-weight: 700;
+    color: var(--dim);
+    line-height: 16px;
+    text-align: center;
+  }
+
+  /* ---------- panels ---------- */
+  .p-title {
+    font-size: 18.6px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 24px;
+  }
+  .p-api {
+    font-family: var(--mono);
+    font-size: 11.7px;
+    line-height: 16px;
+  }
+  .step-badge {
+    width: 23px;
+    height: 23px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .step-title {
+    font-size: 14.3px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 18px;
+  }
+  .step-sub {
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 18px;
+  }
+  .caption {
+    font-size: 12.4px;
+    color: #6c7a93;
+    line-height: 16px;
+  }
+  .p-note {
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 19px;
+  }
+
+  .chips {
+    display: flex;
+    align-items: stretch;
+    height: 29px;
+  }
+  .chip {
+    box-sizing: border-box;
+    height: 29px;
+    border-radius: 5px;
+    border: 1px solid;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  .sizes {
+    display: flex;
+  }
+  .sizes > div {
+    font-size: 11px;
+    color: #5d6a83;
+    text-align: center;
+    line-height: 14px;
+  }
+
+  .c-violet {
+    background: #2d2f4e;
+    border-color: rgba(167, 139, 250, 0.3);
+    color: #cdbbff;
+  }
+  .c-violet-s {
+    background: #2d2f4e;
+    border-color: rgba(167, 139, 250, 0.45);
+    color: #cdbbff;
+  }
+  .c-slate {
+    background: #232b3a;
+    border-color: rgba(185, 198, 220, 0.22);
+    color: #b9c6dc;
+  }
+  .c-sky {
+    background: #1c364c;
+    border-color: rgba(63, 190, 247, 0.42);
+    color: #3fbef7;
+  }
+  .c-rose {
+    background: #352839;
+    border-color: rgba(251, 113, 133, 0.42);
+    color: #ffb0bb;
+  }
+  .c-emerald {
+    background: #18373c;
+    border-color: rgba(52, 211, 153, 0.38);
+    color: #34d399;
+  }
+  .c-amber {
+    background: #36322d;
+    border-color: rgba(245, 178, 63, 0.45);
+    color: #f5b23f;
+  }
+
+  /* ---------- decrypt lane ---------- */
+  .s-title {
+    font-size: 16.3px;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 20px;
+  }
+  .s-body {
+    font-size: 13.4px;
+    color: var(--muted);
+    line-height: 17px;
+  }
+
+  .alert {
+    box-sizing: border-box;
+    border: 1px solid rgba(251, 113, 133, 0.28);
+    border-radius: 8px;
+    background: linear-gradient(180deg, #1b1729 0%, #171523 100%);
+  }
+  .alert-title {
+    font-size: 16.3px;
+    font-weight: 700;
+    color: #ffb0bb;
+    line-height: 20px;
+  }
+  .alert-body {
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 19px;
+  }
+
+  .foot {
+    font-size: 12.45px;
+    color: var(--muted);
+    line-height: 16px;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+</style>
+
+<div class="page">
+  <!-- ================= HEADER ================= -->
+  <div class="a kicker" style="left: 64px; top: 72px">
+    github.com/pilinux/crypt · package envelope
+  </div>
+  <div class="a h1" style="left: 64px; top: 102px">
+    Envelope encryption, end to end
+  </div>
+  <div class="a lede" style="left: 64px; top: 159px">
+    One master key. A fresh sub-key for every item and every stream.
+    XChaCha20-Poly1305 everywhere.
+  </div>
+
+  <!-- ================= 1 · KEY LADDER ================= -->
+  <div
+    class="a badge"
+    style="
+      left: 64px;
+      top: 225px;
+      border: 1px solid rgba(167, 139, 250, 0.45);
+      color: var(--violet);
+      background: rgba(167, 139, 250, 0.1);
+    "
+  >
+    1
+  </div>
+  <div class="a eyebrow" style="left: 98px; top: 229.5px; color: var(--violet)">
+    Set up once
+  </div>
+  <div class="a h2" style="left: 98px; top: 246px">The key ladder</div>
+  <div class="a h2sub" style="left: 98px; top: 280px">
+    Only the leaf key ever touches your data.
+  </div>
+  <div
+    class="a note-right"
+    style="left: 64px; top: 229px; width: 1552px; text-align: right"
+  >
+    keys live in memory, never on the wire
+  </div>
+  <div class="a rule" style="left: 64px; top: 315px; width: 1552px"></div>
+
+  <!-- card 1: app secret -->
+  <div
+    class="a bar"
+    style="left: 64px; top: 352px; width: 437px; background: var(--violet)"
+  ></div>
+  <div
+    class="a card"
+    style="left: 64px; top: 356.5px; width: 437px; height: 123.5px"
+  ></div>
+  <div class="a card-title" style="left: 88px; top: 376px">App secret</div>
+  <div class="a card-mono" style="left: 88px; top: 405px; color: var(--violet)">
+    ≥ 32 bytes, machine-generated
+  </div>
+  <div class="a card-body" style="left: 88px; top: 430px; width: 400px">
+    From your env or secret manager.<br />Never stored beside the data.
+  </div>
+
+  <!-- card 2: KEK -->
+  <div
+    class="a bar"
+    style="left: 621px; top: 352px; width: 437px; background: var(--violet)"
+  ></div>
+  <div
+    class="a card"
+    style="left: 621px; top: 356.5px; width: 437px; height: 123.5px"
+  ></div>
+  <div class="a card-title" style="left: 645px; top: 376px">KEK</div>
+  <div
+    class="a card-mono"
+    style="left: 645px; top: 405px; color: var(--violet)"
+  >
+    32 bytes · DeriveKEK
+  </div>
+  <div class="a card-body" style="left: 645px; top: 430px; width: 400px">
+    HKDF-SHA256 of the secret.<br />Zero() it once the wrapping is done.
+  </div>
+
+  <!-- card 3: master key -->
+  <div
+    class="a bar"
+    style="left: 1178px; top: 352px; width: 437px; background: var(--emerald)"
+  ></div>
+  <div
+    class="a card"
+    style="left: 1178px; top: 356.5px; width: 437px; height: 123.5px"
+  ></div>
+  <div class="a card-title" style="left: 1202px; top: 376px">
+    Master key (DEK)
+  </div>
+  <div
+    class="a card-mono"
+    style="left: 1202px; top: 405px; color: var(--emerald)"
+  >
+    32 bytes · GenerateMasterKey
+  </div>
+  <div class="a card-body" style="left: 1202px; top: 430px; width: 400px">
+    crypto/rand, generated once, ever.<br />In the clear only in memory.
+  </div>
+
+  <!-- arrow: secret -> KEK -->
+  <div
+    class="a alabel"
+    style="left: 461px; top: 391.5px; width: 200px; color: var(--violet)"
+  >
+    HKDF-SHA256
+  </div>
+  <svg
+    class="a"
+    style="left: 501px; top: 405px"
+    width="120"
+    height="24"
+    viewBox="0 0 120 24"
+  >
+    <line x1="13" y1="11" x2="99" y2="11" stroke="#A78BFA" stroke-width="2" />
+    <path d="M99 5 L107 11 L99 17 Z" fill="#A78BFA" />
+  </svg>
+  <div class="a alabel-dim" style="left: 461px; top: 427.5px; width: 200px">
+    info = KEK label
+  </div>
+
+  <!-- arrows: KEK <-> master key -->
+  <div
+    class="a alabel"
+    style="left: 1018px; top: 379px; width: 200px; color: var(--violet)"
+  >
+    UnwrapKey
+  </div>
+  <svg
+    class="a"
+    style="left: 1058px; top: 393px"
+    width="120"
+    height="24"
+    viewBox="0 0 120 24"
+  >
+    <line x1="13" y1="11" x2="99" y2="11" stroke="#A78BFA" stroke-width="2" />
+    <path d="M99 5 L107 11 L99 17 Z" fill="#A78BFA" />
+  </svg>
+  <svg
+    class="a"
+    style="left: 1058px; top: 427px"
+    width="120"
+    height="24"
+    viewBox="0 0 120 24"
+  >
+    <line x1="21" y1="11" x2="107" y2="11" stroke="#A78BFA" stroke-width="2" />
+    <path d="M21 5 L13 11 L21 17 Z" fill="#A78BFA" />
+  </svg>
+  <div
+    class="a alabel"
+    style="left: 1018px; top: 449px; width: 200px; color: var(--violet)"
+  >
+    WrapKey
+  </div>
+
+  <!-- dashed drop into the wrapped key -->
+  <svg
+    class="a"
+    style="left: 1103px; top: 466px"
+    width="30"
+    height="66"
+    viewBox="0 0 30 66"
+  >
+    <line
+      x1="15"
+      y1="0"
+      x2="15"
+      y2="50"
+      stroke="#A78BFA"
+      stroke-width="2"
+      stroke-dasharray="3 5"
+    />
+    <path d="M9 50 L21 50 L15 60 Z" fill="#A78BFA" />
+  </svg>
+
+  <!-- wrapped master key -->
+  <div
+    class="a"
+    style="
+      left: 882px;
+      top: 531px;
+      width: 471px;
+      height: 97px;
+      box-sizing: border-box;
+      border: 1px solid rgba(167, 139, 250, 0.28);
+      border-radius: 14px;
+      background: linear-gradient(180deg, #1a2039 0%, #171c34 100%);
+    "
+  ></div>
+  <div
+    class="a"
+    style="
+      left: 882px;
+      top: 546px;
+      width: 471px;
+      text-align: center;
+      font-size: 16.3px;
+      font-weight: 700;
+      color: var(--ink);
+      line-height: 20px;
+    "
+  >
+    Wrapped master key · 72 bytes
+  </div>
+  <div
+    class="a mono"
+    style="
+      left: 882px;
+      top: 572px;
+      width: 471px;
+      text-align: center;
+      font-size: 12px;
+      color: #b9afe8;
+      line-height: 16px;
+    "
+  >
+    nonce(24) ‖ encrypted master key(32) ‖ tag(16)
+  </div>
+  <div
+    class="a"
+    style="
+      left: 882px;
+      top: 595px;
+      width: 471px;
+      text-align: center;
+      font-size: 12.3px;
+      color: var(--dim);
+      line-height: 16px;
+    "
+  >
+    the one value you store next to your data
+  </div>
+
+  <!-- ================= 2 · ENCRYPT ================= -->
+  <div
+    class="a badge"
+    style="
+      left: 64px;
+      top: 614px;
+      border: 1px solid rgba(63, 190, 247, 0.45);
+      color: var(--sky);
+      background: rgba(63, 190, 247, 0.1);
+    "
+  >
+    2
+  </div>
+  <div class="a eyebrow" style="left: 98px; top: 618.5px; color: var(--sky)">
+    Encrypt
+  </div>
+  <div class="a h2" style="left: 98px; top: 636px">
+    Seal: three ways to use the one master key
+  </div>
+  <div class="a h2sub" style="left: 98px; top: 670px">
+    Pick by size: an item held in memory, a stream of any size, or a stream
+    whose length is hidden too.
+  </div>
+  <div class="a rule" style="left: 64px; top: 705px; width: 1552px"></div>
+
+  <!-- pill -->
+  <div
+    class="a"
+    style="
+      left: 624px;
+      top: 725px;
+      width: 431px;
+      height: 41px;
+      box-sizing: border-box;
+      border: 1px solid rgba(52, 211, 153, 0.3);
+      border-radius: 999px;
+      background: #10212d;
+    "
+  ></div>
+  <div
+    class="a"
+    style="
+      left: 624px;
+      top: 736px;
+      width: 431px;
+      text-align: center;
+      font-size: 14.4px;
+      font-weight: 700;
+      color: #7fe7c1;
+      line-height: 20px;
+    "
+  >
+    master key, unwrapped in memory
+  </div>
+
+  <!-- connector -->
+  <svg
+    class="a"
+    style="left: 290px; top: 766px"
+    width="1100"
+    height="60"
+    viewBox="0 0 1100 60"
+  >
+    <g stroke="#289A76" stroke-width="2" fill="none">
+      <path d="M550 0 V28" />
+      <path d="M20.5 28 H1079.5" />
+      <path d="M20.5 28 V44" />
+      <path d="M550 28 V44" />
+      <path d="M1079.5 28 V44" />
+    </g>
+    <g fill="#34D399">
+      <path d="M14 44 L27 44 L20.5 55 Z" />
+      <path d="M543.5 44 L556.5 44 L550 55 Z" />
+      <path d="M1073 44 L1086 44 L1079.5 55 Z" />
+    </g>
+  </svg>
+
+  <!-- ---------- panel 1: single-shot ---------- -->
+  <div
+    class="a bar"
+    style="left: 64px; top: 834px; width: 493px; background: var(--sky)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 64px; top: 839px; width: 493px; height: 611px"
+  ></div>
+  <div class="a p-title" style="left: 90px; top: 859px">Single-shot</div>
+  <div class="a p-api" style="left: 90px; top: 888px; color: var(--sky)">
+    SealBytes · SealString · SealInt64
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 90px;
+      top: 932px;
+      border: 1px solid rgba(63, 190, 247, 0.4);
+      color: var(--sky);
+    "
+  >
+    1
+  </div>
+  <div class="a step-title" style="left: 124px; top: 934px">
+    Fresh 16-byte salt
+  </div>
+  <div class="a step-sub" style="left: 124px; top: 957px">
+    random, one per item
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 90px;
+      top: 993px;
+      border: 1px solid rgba(63, 190, 247, 0.4);
+      color: var(--sky);
+    "
+  >
+    2
+  </div>
+  <div class="a step-title" style="left: 124px; top: 995px">
+    sub-key = HKDF(master key, salt)
+  </div>
+  <div class="a step-sub" style="left: 124px; top: 1018px">
+    a key that seals exactly one item
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 90px;
+      top: 1054px;
+      border: 1px solid rgba(63, 190, 247, 0.4);
+      color: var(--sky);
+    "
+  >
+    3
+  </div>
+  <div class="a step-title" style="left: 124px; top: 1056px">
+    XChaCha20-Poly1305
+  </div>
+  <div class="a step-sub" style="left: 124px; top: 1079px">
+    random 24-byte nonce<br />header + your AAD authenticated
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 90px;
+      top: 1132px;
+      border: 1px solid rgba(63, 190, 247, 0.4);
+      color: var(--sky);
+    "
+  >
+    4
+  </div>
+  <div class="a step-title" style="left: 124px; top: 1134px">
+    Base64 for String and Int64
+  </div>
+  <div class="a step-sub" style="left: 124px; top: 1157px">
+    the token drops straight into JSON
+  </div>
+
+  <div class="a caption" style="left: 90px; top: 1214px">
+    one self-describing blob
+  </div>
+  <div
+    class="a chips"
+    style="left: 89.5px; top: 1238px; width: 439px; gap: 1.75px"
+  >
+    <div class="chip c-violet-s" style="flex: 35.5 0 0">0x01</div>
+    <div class="chip c-violet-s" style="flex: 26.5 0 0">16</div>
+    <div class="chip c-violet" style="flex: 69 0 0">salt</div>
+    <div class="chip c-slate" style="flex: 92 0 0">nonce</div>
+    <div class="chip c-sky" style="flex: 139.5 0 0">ciphertext</div>
+    <div class="chip c-rose" style="flex: 68.5 0 0">tag</div>
+  </div>
+  <div
+    class="a sizes"
+    style="left: 89.5px; top: 1271px; width: 439px; gap: 1.75px"
+  >
+    <div style="flex: 35.5 0 0">1</div>
+    <div style="flex: 26.5 0 0">1</div>
+    <div style="flex: 69 0 0">16</div>
+    <div style="flex: 92 0 0">24</div>
+    <div style="flex: 139.5 0 0">n</div>
+    <div style="flex: 68.5 0 0">16</div>
+  </div>
+
+  <div class="a p-note" style="left: 90px; top: 1360px; width: 445px">
+    58 bytes of overhead, flat, and the whole item sits in<br />memory. An int64
+    is always sealed fixed-width, so the<br />token length can never leak its
+    magnitude.
+  </div>
+
+  <!-- ---------- panel 2: streaming ---------- -->
+  <div
+    class="a bar"
+    style="left: 593px; top: 834px; width: 493px; background: var(--emerald)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 593px; top: 839px; width: 493px; height: 611px"
+  ></div>
+  <div class="a p-title" style="left: 619px; top: 859px">Streaming</div>
+  <div class="a p-api" style="left: 619px; top: 888px; color: var(--emerald)">
+    SealWriter · SealStream · SealFile
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 619px;
+      top: 932px;
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      color: var(--emerald);
+    "
+  >
+    1
+  </div>
+  <div class="a step-title" style="left: 653px; top: 934px">
+    Fresh 16-byte salt
+  </div>
+  <div class="a step-sub" style="left: 653px; top: 957px">
+    random, one per stream
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 619px;
+      top: 993px;
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      color: var(--emerald);
+    "
+  >
+    2
+  </div>
+  <div class="a step-title" style="left: 653px; top: 995px">
+    sub-key = HKDF(master key, salt)
+  </div>
+  <div class="a step-sub" style="left: 653px; top: 1018px">
+    one key for every chunk of this stream
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 619px;
+      top: 1054px;
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      color: var(--emerald);
+    "
+  >
+    3
+  </div>
+  <div class="a step-title" style="left: 653px; top: 1056px">
+    Cut into chunks, seal each one
+  </div>
+  <div class="a step-sub" style="left: 653px; top: 1079px">
+    nonce = prefix(15) ‖ counter(8) ‖ final(1)<br />every chunk: header ‖
+    SHA-256(tag ‖ your AAD)
+  </div>
+
+  <div class="a caption" style="left: 619px; top: 1214px">
+    header, written once
+  </div>
+  <div
+    class="a chips"
+    style="left: 618.5px; top: 1238px; width: 439px; gap: 1.75px"
+  >
+    <div class="chip c-violet-s" style="flex: 43.5 0 0">0x81</div>
+    <div class="chip c-violet-s" style="flex: 33.5 0 0">16</div>
+    <div class="chip c-violet" style="flex: 89 0 0">salt</div>
+    <div class="chip c-violet" style="flex: 122.5 0 0">chunkSize</div>
+    <div class="chip c-slate" style="flex: 145 0 0">noncePrefix</div>
+  </div>
+  <div
+    class="a sizes"
+    style="left: 618.5px; top: 1271px; width: 439px; gap: 1.75px"
+  >
+    <div style="flex: 43.5 0 0">1</div>
+    <div style="flex: 33.5 0 0">1</div>
+    <div style="flex: 89 0 0">16</div>
+    <div style="flex: 122.5 0 0">4</div>
+    <div style="flex: 145 0 0">15</div>
+  </div>
+
+  <div class="a caption" style="left: 619px; top: 1297px">
+    then one sealed chunk after another
+  </div>
+  <div
+    class="a chips"
+    style="left: 618.5px; top: 1317px; width: 439px; gap: 1.75px"
+  >
+    <div class="chip c-emerald" style="flex: 128 0 0">chunk 0 + tag</div>
+    <div class="chip c-emerald" style="flex: 128 0 0">chunk 1 + tag</div>
+    <div class="chip c-emerald" style="flex: 35.5 0 0">…</div>
+    <div class="chip c-emerald" style="flex: 141 0 0">last + tag ✓</div>
+  </div>
+
+  <div class="a p-note" style="left: 619px; top: 1360px; width: 445px">
+    Memory stays at one chunk (1 MiB by default), whatever<br />the file size.
+    The counter pins a chunk to its position and<br />the flag marks the end:
+    reorder, drop or truncate all fail.
+  </div>
+
+  <!-- ---------- panel 3: padded stream ---------- -->
+  <div
+    class="a bar"
+    style="left: 1122px; top: 834px; width: 493px; background: var(--amber)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 1122px; top: 839px; width: 493px; height: 611px"
+  ></div>
+  <div class="a p-title" style="left: 1148px; top: 859px">Padded stream</div>
+  <div class="a p-api" style="left: 1148px; top: 888px; color: var(--amber)">
+    SealPaddedStream · SealPaddedFile · SealPaddedAt
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 1148px;
+      top: 932px;
+      border: 1px solid rgba(245, 178, 63, 0.4);
+      color: var(--amber);
+    "
+  >
+    1
+  </div>
+  <div class="a step-title" style="left: 1182px; top: 934px">
+    Frame the payload
+  </div>
+  <div class="a step-sub" style="left: 1182px; top: 957px">
+    0x01 ‖ realLen(8) ‖ payload
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 1148px;
+      top: 993px;
+      border: 1px solid rgba(245, 178, 63, 0.4);
+      color: var(--amber);
+    "
+  >
+    2
+  </div>
+  <div class="a step-title" style="left: 1182px; top: 995px">
+    Pad the tail with zeros
+  </div>
+  <div class="a step-sub" style="left: 1182px; top: 1018px">
+    up to the next Padmé bucket, ≤ ~12% overhead
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 1148px;
+      top: 1054px;
+      border: 1px solid rgba(245, 178, 63, 0.4);
+      color: var(--amber);
+    "
+  >
+    3
+  </div>
+  <div class="a step-title" style="left: 1182px; top: 1056px">
+    Seal it under the padded tag
+  </div>
+  <div class="a step-sub" style="left: 1182px; top: 1079px">
+    same 0x81 bytes on disk, its own AAD binding
+  </div>
+
+  <div
+    class="a step-badge"
+    style="
+      left: 1148px;
+      top: 1115px;
+      border: 1px solid rgba(245, 178, 63, 0.4);
+      color: var(--amber);
+    "
+  >
+    4
+  </div>
+  <div class="a step-title" style="left: 1182px; top: 1117px">
+    Sizes collapse onto buckets
+  </div>
+  <div class="a step-sub" style="left: 1182px; top: 1140px">
+    94,500 · 96,037 · 96,200 → one 96,309-byte file
+  </div>
+
+  <div class="a caption" style="left: 1148px; top: 1214px">
+    what those chunks encrypt
+  </div>
+  <div
+    class="a chips"
+    style="left: 1147.5px; top: 1238px; width: 439px; gap: 1.75px"
+  >
+    <div class="chip c-violet-s" style="flex: 33.5 0 0">0x01</div>
+    <div class="chip c-violet-s" style="flex: 78 0 0">realLen</div>
+    <div class="chip c-amber" style="flex: 174.5 0 0">payload</div>
+    <div class="chip c-slate" style="flex: 148 0 0">zero padding</div>
+  </div>
+  <div
+    class="a sizes"
+    style="left: 1147.5px; top: 1271px; width: 439px; gap: 1.75px"
+  >
+    <div style="flex: 33.5 0 0">1</div>
+    <div style="flex: 78 0 0">8</div>
+    <div style="flex: 174.5 0 0">n</div>
+    <div style="flex: 148 0 0"></div>
+  </div>
+
+  <svg
+    class="a"
+    style="left: 1354px; top: 1286px"
+    width="30"
+    height="26"
+    viewBox="0 0 30 26"
+  >
+    <line x1="15" y1="0" x2="15" y2="16" stroke="#F5B23F" stroke-width="2" />
+    <path d="M9 15 L21 15 L15 25 Z" fill="#F5B23F" />
+  </svg>
+  <div
+    class="a"
+    style="
+      left: 1148px;
+      top: 1316px;
+      width: 445px;
+      text-align: center;
+      font-size: 11.8px;
+      font-weight: 700;
+      color: var(--amber);
+      line-height: 16px;
+    "
+  >
+    sealed by the streaming path → same 0x81 file, padded tag
+  </div>
+
+  <div class="a p-note" style="left: 1148px; top: 1341px; width: 445px">
+    The padding is encrypted and authenticated like real data,<br />so the file
+    size no longer states the exact payload length.<br />All of it sits at the
+    tail: interior chunks are full anyway.<br />Only OpenPaddedStream reads one
+    back.
+  </div>
+
+  <!-- ================= 3 · DECRYPT ================= -->
+  <div
+    class="a badge"
+    style="
+      left: 64px;
+      top: 1504px;
+      border: 1px solid rgba(251, 113, 133, 0.45);
+      color: var(--rose);
+      background: rgba(251, 113, 133, 0.1);
+    "
+  >
+    3
+  </div>
+  <div class="a eyebrow" style="left: 98px; top: 1508.5px; color: var(--rose)">
+    Decrypt
+  </div>
+  <div class="a h2" style="left: 98px; top: 1526px">
+    Open: the same ladder, walked backwards
+  </div>
+  <div class="a h2sub" style="left: 98px; top: 1560px">
+    Unwrap the master key, read the salt out of the blob, re-derive the very
+    same sub-key.
+  </div>
+  <div class="a rule" style="left: 64px; top: 1595px; width: 1552px"></div>
+
+  <!-- step 1 -->
+  <div
+    class="a bar"
+    style="left: 64px; top: 1628px; width: 267px; background: var(--rose)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 64px; top: 1633px; width: 267px; height: 147px"
+  ></div>
+  <div class="a s-title" style="left: 84.5px; top: 1652px">
+    Sealed blob or file
+  </div>
+  <div class="a s-body" style="left: 84.5px; top: 1678px; width: 220px">
+    Plus the identical AAD you<br />sealed it with, which is<br />never stored
+    anywhere.
+  </div>
+
+  <!-- step 2 -->
+  <div
+    class="a bar"
+    style="left: 385px; top: 1628px; width: 267px; background: var(--rose)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 385px; top: 1633px; width: 267px; height: 147px"
+  ></div>
+  <div class="a s-title" style="left: 405.5px; top: 1652px">
+    Read the header
+  </div>
+  <div class="a s-body" style="left: 405.5px; top: 1678px; width: 220px">
+    The first byte picks the<br />reader: 0x01 envelope,<br />0x81 stream.
+    Anything else<br />is rejected outright.
+  </div>
+
+  <!-- step 3 -->
+  <div
+    class="a bar"
+    style="left: 706px; top: 1628px; width: 267px; background: var(--rose)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 706px; top: 1633px; width: 267px; height: 147px"
+  ></div>
+  <div class="a s-title" style="left: 726.5px; top: 1652px">
+    Re-derive the sub-key
+  </div>
+  <div class="a s-body" style="left: 726.5px; top: 1678px; width: 220px">
+    The salt travels in the clear,<br />so HKDF(master key, salt)<br />returns
+    the same key.<br />Wiped again on return.
+  </div>
+
+  <!-- step 4 -->
+  <div
+    class="a bar"
+    style="left: 1027px; top: 1628px; width: 267px; background: var(--rose)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 1027px; top: 1633px; width: 267px; height: 147px"
+  ></div>
+  <div class="a s-title" style="left: 1047.5px; top: 1652px">
+    Verify, then decrypt
+  </div>
+  <div class="a s-body" style="left: 1047.5px; top: 1678px; width: 220px">
+    Poly1305 over header ‖ AAD,<br />and a stream's format tag too.<br />Every
+    chunk is checked, with<br />its counter and its final flag.
+  </div>
+
+  <!-- step 5 -->
+  <div
+    class="a bar"
+    style="left: 1348px; top: 1628px; width: 267px; background: var(--emerald)"
+  ></div>
+  <div
+    class="a panel"
+    style="left: 1348px; top: 1633px; width: 267px; height: 147px"
+  ></div>
+  <div class="a s-title" style="left: 1368.5px; top: 1652px">Plaintext</div>
+  <div class="a s-body" style="left: 1368.5px; top: 1678px; width: 220px">
+    Bytes, string or int64. A<br />stream writes chunk by chunk;<br />a padded
+    one takes realLen,<br />then drains the rest.
+  </div>
+
+  <!-- lane arrows -->
+  <svg
+    class="a"
+    style="left: 331px; top: 1694px"
+    width="54"
+    height="20"
+    viewBox="0 0 54 20"
+  >
+    <line x1="16" y1="10" x2="34" y2="10" stroke="#5A6580" stroke-width="2" />
+    <path d="M34 5 L41 10 L34 15 Z" fill="#5A6580" />
+  </svg>
+  <svg
+    class="a"
+    style="left: 652px; top: 1694px"
+    width="54"
+    height="20"
+    viewBox="0 0 54 20"
+  >
+    <line x1="16" y1="10" x2="34" y2="10" stroke="#5A6580" stroke-width="2" />
+    <path d="M34 5 L41 10 L34 15 Z" fill="#5A6580" />
+  </svg>
+  <svg
+    class="a"
+    style="left: 973px; top: 1694px"
+    width="54"
+    height="20"
+    viewBox="0 0 54 20"
+  >
+    <line x1="16" y1="10" x2="34" y2="10" stroke="#5A6580" stroke-width="2" />
+    <path d="M34 5 L41 10 L34 15 Z" fill="#5A6580" />
+  </svg>
+  <svg
+    class="a"
+    style="left: 1294px; top: 1694px"
+    width="54"
+    height="20"
+    viewBox="0 0 54 20"
+  >
+    <line x1="16" y1="10" x2="34" y2="10" stroke="#5A6580" stroke-width="2" />
+    <path d="M34 5 L41 10 L34 15 Z" fill="#5A6580" />
+  </svg>
+
+  <!-- alert -->
+  <div
+    class="a alert"
+    style="left: 64px; top: 1820px; width: 1552px; height: 74px"
+  ></div>
+  <div class="a alert-title" style="left: 90px; top: 1836px">
+    ✗ Authentication is all or nothing
+  </div>
+  <div class="a alert-body" style="left: 90px; top: 1862px">
+    Wrong key, wrong AAD, one flipped bit, a chunk reordered, duplicated or
+    dropped, a stream cut short: every one of them ends as an error, never as
+    plaintext.
+  </div>
+
+  <!-- footer -->
+  <div
+    class="a dot"
+    style="left: 64px; top: 1932px; background: var(--violet)"
+  ></div>
+  <div class="a foot" style="left: 83px; top: 1928px">
+    AAD is authenticated, never stored.
+  </div>
+  <div
+    class="a dot"
+    style="left: 581px; top: 1932px; background: var(--emerald)"
+  ></div>
+  <div class="a foot" style="left: 600px; top: 1928px">
+    Sub-keys are wiped on return; the KEK and master key are yours to Zero().
+  </div>
+  <div
+    class="a dot"
+    style="left: 1098px; top: 1932px; background: var(--sky)"
+  ></div>
+  <div class="a foot" style="left: 1117px; top: 1928px">
+    Equal plaintexts never seal to equal bytes: fresh salt, fresh nonce, every
+    time.
+  </div>
+</div>

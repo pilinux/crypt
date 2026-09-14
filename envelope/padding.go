@@ -218,6 +218,77 @@ func (s *Scheme) SealPaddedStreamAAD(masterKey []byte, dst io.Writer, src io.Rea
 	return size, nil
 }
 
+// SealPaddedAt seals everything readable from src into dst, padded, with no
+// size needed up front. It is shorthand for [Scheme.SealPaddedAtAAD] with a nil
+// AAD.
+func (s *Scheme) SealPaddedAt(masterKey []byte, dst io.WriterAt, src io.Reader) (int64, error) {
+	return s.SealPaddedAtAAD(masterKey, dst, src, nil)
+}
+
+// SealPaddedAtAAD is [Scheme.SealPaddedStreamAAD] for a source of unknown
+// length, such as a multipart upload, and writes the same format. The frame
+// lives in chunk 0, so chunk 0 is held in memory, sealed exactly once after the
+// rest, and written at its offset; hence dst must be an empty [io.WriterAt].
+// It returns the payload length. Only io.EOF ends src, and on error dst holds a
+// partial stream for the caller to discard.
+func (s *Scheme) SealPaddedAtAAD(masterKey []byte, dst io.WriterAt, src io.Reader, aad []byte) (int64, error) {
+	ow := io.NewOffsetWriter(dst, 0)
+	w, err := s.sealWriter(masterKey, ow, paddedStreamTag, aad)
+	if err != nil {
+		return 0, err
+	}
+	defer w.Abort() // no-op once Close has succeeded
+
+	// The writer seals from chunk 1, whose offset is fixed because every
+	// non-final chunk is chunkSize+TagSize; counter 0 is sealed only below.
+	c := len(w.buf)
+	w.counter = 1
+	if _, err := ow.Seek(int64(streamHeaderSize+c+TagSize), io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	head := make([]byte, c, c+TagSize)
+	defer Zero(head)
+	h, err := readFull(src, head[paddingFrameSize:])
+	n := int64(h)
+	if err == nil {
+		m, err := w.ReadFrom(src)
+		if err != nil {
+			return n + m, err
+		}
+		n += m
+	} else if !errors.Is(err, io.EOF) {
+		return n, err
+	}
+
+	target := PaddedSize(n)
+	if target == 0 {
+		return n, ErrSourceSize
+	}
+	if pad := target - int64(c) - (n - int64(h)); pad > 0 {
+		if _, err := io.CopyN(w, zeroReader{}, pad); err != nil {
+			return n, err
+		}
+	}
+
+	head[0] = paddingVersion
+	binary.BigEndian.PutUint64(head[1:paddingFrameSize], uint64(n)) // #nosec G115 -- n >= 0
+	clear(head[paddingFrameSize+h:])                                // src may have scribbled past h
+
+	final := target <= int64(c)
+	if !final {
+		if err := w.Close(); err != nil {
+			return n, err
+		}
+	}
+	streamNonce(w.nonce[:], w.prefix, 0, final)
+	chunk := w.aead.Seal(head[:0], w.nonce[:], head[:min(target, int64(c))], w.aad)
+	if err := writeAll(io.NewOffsetWriter(dst, streamHeaderSize), chunk); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 // PaddedReader pulls the payload out of a stream sealed by
 // [Scheme.SealPaddedStreamAAD] and throws the padding away. Use it when you
 // want the payload length up front: a handler can set Content-Length from

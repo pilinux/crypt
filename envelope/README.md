@@ -347,15 +347,16 @@ header, so interior chunks carry no length information and padding them would
 hide nothing. Whether the padding fills out the final chunk or adds whole
 chunks after it is just arithmetic on the bucket size.
 
-#### Two ways in, one format
+#### Three ways in, one format
 
 | Entry point | Source | Where the size comes from |
 | --- | --- | --- |
 | `SealPaddedStream[AAD](masterKey, dst, src, size, aad)` | any `io.Reader` | the `size` argument |
 | `SealPaddedFile[AAD](masterKey, dstPath, srcPath, aad)` | a path | `Stat` on the open handle |
+| `SealPaddedAt[AAD](masterKey, dst, src, aad)` | any `io.Reader`, into an `io.WriterAt` | counted while reading |
 
-The file form is a `pipeFile` wrapper around the stream form, so both write the
-identical blob and either one opens what the other sealed.
+The file form is a `pipeFile` wrapper around the stream form, and
+`SealPaddedAt` writes the same format, so every opener reads all three.
 
 **Padding costs no memory and no scratch space.** The frame, the payload and
 the zero padding are stitched together with `io.MultiReader` and pulled through
@@ -371,7 +372,14 @@ different number of bytes fails with `ErrSourceSize` rather than producing a
 frame that lies about its payload; `SealPaddedFile` removes the partial
 destination for you, a stream caller must discard `dst` itself.
 
-**When the length cannot be known up front, defer the padding.** An HTML
+**Unless `dst` can seek.** A chunk's nonce depends on its position, not on when
+it is sealed, so `SealPaddedAt` holds chunk 0 (where the frame lives) in memory,
+seals chunks 1 onward at their fixed offsets `37 + i*(chunkSize+16)`, and at
+`io.EOF` fills in the frame, seals chunk 0 exactly once and writes it at offset
+37. It costs a second chunk of memory, and with no declared size only `io.EOF`
+marks the payload complete.
+
+**When the length cannot be known up front and `dst` cannot seek, defer the padding.** An HTML
 multipart upload sends no per-part `Content-Length`, and the browser picks the
 file after the page loads, so nothing can state the length before the bytes
 arrive. Rather than staging the upload to learn its size, seal it with
@@ -802,6 +810,12 @@ into a source that delivers exactly that many bytes or says which way it missed.
   frame that lies about the payload. Returns the real payload length, not the
   padded one. Nothing beyond one chunk is buffered, so an in-memory blob, an
   HTTP body or a pipe is padded and sealed on the fly.
+- `(*Scheme) SealPaddedAt(masterKey, dst, src)` → `SealPaddedAtAAD(..., nil)`.
+- `(*Scheme) SealPaddedAtAAD(masterKey, dst, src, aad)`: the sizeless form into an
+  `io.WriterAt`. `sealWriter` with its counter at 1 and an `io.OffsetWriter`
+  seeked past chunk 0 takes the rest of the payload and the zeros; chunk 0's
+  plaintext is held, framed once `n` is known, sealed exactly once with counter 0
+  and written at offset 37 through `writeAll`. Two chunks of memory.
 - `PaddedReader`: the pull form, an `io.ReadCloser` plus `io.WriterTo` over the
   payload. Holds the `StreamReader`, the framed `size`, the payload `left`, the
   `pad` still to drain and a sticky `err` (`io.EOF` on a clean end). No buffers

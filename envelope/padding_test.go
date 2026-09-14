@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -576,6 +577,98 @@ func TestSealOpenPaddedStream(t *testing.T) {
 				t.Error("round-tripped payload differs")
 			}
 		})
+	}
+}
+
+// atRecorder is an in-memory io.WriterAt that logs every write.
+type atRecorder struct {
+	buf    []byte
+	writes [][2]int // offset, length
+}
+
+func (a *atRecorder) WriteAt(p []byte, off int64) (int, error) {
+	if end := int(off) + len(p); end > len(a.buf) {
+		a.buf = append(a.buf, make([]byte, end-len(a.buf))...)
+	}
+	copy(a.buf[off:], p)
+	a.writes = append(a.writes, [2]int{int(off), len(p)})
+	return len(p), nil
+}
+
+// TestSealPaddedAt checks that the sizeless sealer writes the ordinary padded
+// format, every byte exactly once, with chunk 0 written last. A chunk size of
+// 1500 makes the padding spill past chunk 0 while the payload still fits in it.
+func TestSealPaddedAt(t *testing.T) {
+	masterKey := newMasterKey(t)
+
+	for _, s := range []*Scheme{streamScheme(), New(Config{ChunkSize: 1500})} {
+		c := s.chunkSize
+		for _, size := range []int{0, 1, c - 10, c - 9, c - 8, c, 3*c + 7} {
+			for _, dataErr := range []bool{false, true} {
+				payload := randomData(t, size)
+				var src io.Reader = bytes.NewReader(payload)
+				if dataErr {
+					src = iotest.DataErrReader(src) // last bytes arrive with io.EOF
+				}
+
+				rec := &atRecorder{}
+				n, err := s.SealPaddedAt(masterKey, rec, src)
+				if err != nil || n != int64(size) {
+					t.Fatalf("c=%d size=%d: SealPaddedAt = %d, %v", c, size, n, err)
+				}
+
+				var ref bytes.Buffer
+				if _, err := s.SealPaddedStream(masterKey, &ref, bytes.NewReader(payload), int64(size)); err != nil {
+					t.Fatal(err)
+				}
+				if len(rec.buf) != ref.Len() {
+					t.Errorf("c=%d size=%d: sealed %d bytes, SealPaddedStream seals %d", c, size, len(rec.buf), ref.Len())
+				}
+
+				total := 0
+				for i, w := range rec.writes {
+					total += w[1]
+					for _, v := range rec.writes[:i] {
+						if w[0] < v[0]+v[1] && v[0] < w[0]+w[1] {
+							t.Errorf("c=%d size=%d: writes %v and %v overlap", c, size, v, w)
+						}
+					}
+				}
+				if total != len(rec.buf) {
+					t.Errorf("c=%d size=%d: wrote %d bytes into a %d-byte blob", c, size, total, len(rec.buf))
+				}
+				if last := rec.writes[len(rec.writes)-1]; last[0] != streamHeaderSize {
+					t.Errorf("c=%d size=%d: last write at %d, want chunk 0 at %d", c, size, last[0], streamHeaderSize)
+				}
+
+				r, err := s.OpenPaddedReader(masterKey, bytes.NewReader(rec.buf))
+				if err != nil {
+					t.Fatalf("c=%d size=%d: OpenPaddedReader: %v", c, size, err)
+				}
+				got, err := io.ReadAll(r)
+				if err != nil || r.Size() != int64(size) || !bytes.Equal(got, payload) {
+					t.Errorf("c=%d size=%d: opened Size=%d, %d bytes, err %v", c, size, r.Size(), len(got), err)
+				}
+			}
+		}
+	}
+}
+
+// TestSealPaddedAtSourceFailure checks that a source failing before, at and
+// after the end of chunk 0 fails the seal and leaves nothing that opens.
+func TestSealPaddedAtSourceFailure(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	for _, left := range []int{0, testChunkSize - paddingFrameSize, 3 * testChunkSize} {
+		rec := &atRecorder{}
+		src := &failingReader{left: left, err: io.ErrUnexpectedEOF}
+		if _, err := s.SealPaddedAt(masterKey, rec, src); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("left=%d: err = %v, want io.ErrUnexpectedEOF", left, err)
+		}
+		if _, err := s.OpenPaddedStream(masterKey, io.Discard, bytes.NewReader(rec.buf)); err == nil {
+			t.Errorf("left=%d: the partial stream opened", left)
+		}
 	}
 }
 
