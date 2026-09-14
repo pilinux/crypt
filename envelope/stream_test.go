@@ -793,6 +793,30 @@ func TestStreamWriterCloseRefusesAfterSourceFailure(t *testing.T) {
 	}
 }
 
+// TestSealStreamRejectsSourceUnexpectedEOF: a cut-off HTTP or multipart body
+// fails with io.ErrUnexpectedEOF, which must not seal as a complete stream.
+func TestSealStreamRejectsSourceUnexpectedEOF(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+
+	for _, left := range []int{0, 1, testChunkSize, 2*testChunkSize + 1} {
+		var sealed bytes.Buffer
+		src := &failingReader{left: left, err: io.ErrUnexpectedEOF}
+		if _, err := s.SealStream(masterKey, &sealed, src); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("left=%d: err = %v, want io.ErrUnexpectedEOF", left, err)
+		}
+		if _, err := s.OpenStream(masterKey, io.Discard, bytes.NewReader(sealed.Bytes())); err == nil {
+			t.Errorf("left=%d: the truncated stream opened cleanly", left)
+		}
+	}
+
+	// the padded sealer reports the source error, not its own post-condition
+	src := &failingReader{left: 1, err: io.ErrUnexpectedEOF}
+	if _, err := s.SealPaddedStream(masterKey, io.Discard, src, 2); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("SealPaddedStream: err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
 // TestStreamWriterAbort covers the case no sticky error can catch: nothing went
 // wrong with the stream, the caller simply decided not to keep it.
 func TestStreamWriterAbort(t *testing.T) {

@@ -312,6 +312,18 @@ func writeAll(dst io.Writer, p []byte) error {
 	return nil
 }
 
+// readFull fills p from r like io.ReadFull, but returns r's error as is.
+// io.ReadFull reports a partial end as io.ErrUnexpectedEOF, the same error a
+// cut-off HTTP or multipart body returns.
+func readFull(r io.Reader, p []byte) (n int, err error) {
+	for n < len(p) && err == nil {
+		var m int
+		m, err = r.Read(p[n:])
+		n += m
+	}
+	return n, err
+}
+
 // streamAEAD derives the per-stream sub-key from the master key and salt and
 // turns it into a reusable AEAD. The sub-key copy is wiped immediately; the
 // AEAD keeps its own, unreachable copy for the lifetime of the stream.
@@ -447,13 +459,13 @@ func (w *StreamWriter) ReadFrom(r io.Reader) (int64, error) {
 
 	var total int64
 	for {
-		// fill the buffer; a short read means r is exhausted. If the buffer
+		// fill the buffer; io.EOF means r is exhausted. If the buffer
 		// was already full this reads nothing and falls through to the peek.
-		n, err := io.ReadFull(r, w.buf[w.n:])
+		n, err := readFull(r, w.buf[w.n:])
 		w.n += n
 		total += int64(n)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) {
 				return total, nil
 			}
 			// r quit part-way, so the stream is missing plaintext it will
