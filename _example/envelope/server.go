@@ -1,13 +1,15 @@
 package main
 
 // A small HTTP server for trying the streaming API by hand: upload a real file
-// through a real browser form, watch it get sealed without ever touching disk
-// as plaintext, then pad it and see the size snap to a Padmé bucket.
+// through a real browser form, watch it get sealed and padded without ever
+// touching disk as plaintext.
 //
-// It implements the flow the demos describe. A multipart upload cannot state
-// its length, so POST /upload seals it unpadded (SealStream needs no size) and
-// POST /objects/{id}/pad reseals it padded afterwards. PUT /upload/{name} takes
-// a raw body, where Content-Length is exact, and pads on the request path.
+// A multipart upload cannot state its length, but it lands in a file, so POST
+// /upload pads it on the request path with SealPaddedAtAAD, which seals chunk 0
+// last. POST /upload?plain=1 seals it unpadded instead, and POST
+// /objects/{id}/pad reseals it padded afterwards: the flow for a destination
+// that cannot seek. PUT /upload/{name} takes a raw body, where Content-Length is
+// exact, and pads with SealPaddedStreamAAD.
 //
 // Because the padded and plain forms are domain-separated by AAD, nothing can
 // tell them apart from the blob alone; the store records which is which, as
@@ -45,6 +47,10 @@ const maxNameLen = 120
 // maxUpload is the active cap, 0 for none. Set from -max before the server
 // starts and not written again.
 var maxUpload int64 = defaultMaxUpload
+
+// chunkSize is what new objects are sealed with. Set from -chunk before the
+// server starts and not written again; readers take it from each header.
+var chunkSize = envelope.DefaultChunkSize
 
 // limitBody applies the cap, if there is one.
 func limitBody(w http.ResponseWriter, r *http.Request) io.ReadCloser {
@@ -92,7 +98,7 @@ func (o object) Expect() int64 {
 	if padded == 0 {
 		return 0
 	}
-	chunks := (padded + envelope.DefaultChunkSize - 1) / envelope.DefaultChunkSize
+	chunks := (padded + int64(chunkSize) - 1) / int64(chunkSize)
 	if chunks == 0 {
 		chunks = 1
 	}
@@ -186,12 +192,18 @@ func (s *store) endPad(id string, sealed int64) {
 }
 
 // serve runs the upload server until interrupted. dir is where ciphertext goes
-// (empty for a fresh temp dir) and limit caps one upload (0 for none).
-func serve(addr, dir string, limit int64) error {
-	maxUpload = limit
+// (empty for a fresh temp dir), limit caps one upload (0 for none), chunk is
+// the chunk size new objects are sealed with, and debug turns on the [debug]
+// lines.
+func serve(addr, dir string, limit int64, chunk int, debug bool) error {
+	if chunk < envelope.MinChunkSize || chunk > envelope.MaxChunkSize {
+		return fmt.Errorf("-chunk %d is outside %d..%d", chunk, envelope.MinChunkSize, envelope.MaxChunkSize)
+	}
+	maxUpload, chunkSize = limit, chunk
 	scheme := envelope.New(envelope.Config{
 		KEKLabel:    "myapp:kek:v1",
 		SubKeyLabel: "myapp:data-subkey:v1",
+		ChunkSize:   chunk,
 	})
 
 	// Same bootstrap as the demos: derive a KEK, generate a master key, and in
@@ -243,22 +255,45 @@ func serve(addr, dir string, limit int64) error {
 	}
 	fmt.Printf("envelope upload server on http://%s\n", addr)
 	fmt.Printf("ciphertext dir: %s\n", dir)
-	fmt.Printf("upload cap: %s (-max), chunk size: %d bytes\n", limitText, envelope.DefaultChunkSize)
-	fmt.Println("memory stays at one chunk whatever the file size; padding needs")
-	fmt.Println("room for a second copy while it reseals, so size the disk for 2x")
+	fmt.Printf("upload cap: %s (-max), chunk size: %d bytes (-chunk)\n", limitText, chunkSize)
+	fmt.Println("memory stays at two chunks at most whatever the file size; the pad")
+	fmt.Println("button reseals beside the original, so size the disk for 2x")
 	fmt.Println("the master key lives only in memory, so the files die with the process")
+	if debug {
+		fmt.Println("-debug: [debug] lines trace the header, chunk 0 and last chunk of every")
+		fmt.Println("padded upload, payload length and first bytes included")
+	}
 	fmt.Println()
-	fmt.Println("  curl -T ./somefile 'http://" + addr + "/upload/somefile'   # padded on the request path")
-	fmt.Println("  curl -F file=@./somefile 'http://" + addr + "/upload'      # unpadded, pad it from the page")
+	base := "http://" + addr
+	cmds := [][2]string{
+		{"curl '" + base + "/'", "list objects and their ids (HTML page)"},
+		{"curl -T ./somefile '" + base + "/upload/somefile'", "raw body: padded, length from Content-Length"},
+		{"curl -F file=@./somefile '" + base + "/upload'", "multipart: padded, no length needed"},
+		{"curl -F file=@./somefile '" + base + "/upload?plain=1'", "multipart: unpadded, pad it later"},
+		{"curl -X POST '" + base + "/objects/<id>/pad'", "pad an unpadded object"},
+		{"curl -D - -o out.bin '" + base + "/objects/<id>'", "download; headers carry X-Plaintext-Sha256"},
+	}
+	width := 0
+	for _, c := range cmds {
+		width = max(width, len(c[0]))
+	}
+	for _, c := range cmds {
+		fmt.Printf("  %-*s  # %s\n", width, c[0], c[1])
+	}
 	fmt.Println()
+	if debug {
+		installDebugHook()
+	}
 	return srv.ListenAndServe()
 }
 
-// upload takes a browser multipart form. The part carries no length, so the
-// payload is sealed unpadded, streaming, one chunk of memory, and never staged
-// as plaintext anywhere.
+// upload takes a browser multipart form. The part carries no length, but it
+// lands in a file, so SealPaddedAtAAD pads it on the request path; ?plain=1
+// seals it unpadded instead. Either way it streams, and the plaintext is never
+// staged anywhere.
 func (s *store) upload(w http.ResponseWriter, r *http.Request) {
 	r.Body = limitBody(w, r)
+	plain := r.URL.Query().Has("plain")
 
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -283,7 +318,7 @@ func (s *store) upload(w http.ResponseWriter, r *http.Request) {
 			_ = part.Close()
 			continue
 		}
-		if err := s.sealPart(part); err != nil {
+		if err := s.sealPart(part, plain); err != nil {
 			http.Error(w, "sealing upload: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -299,10 +334,11 @@ func (s *store) upload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// sealPart streams one multipart file part into the store, sealed and unpadded.
-// The caller has already established that the part carries a filename, so the
-// concrete type comes in rather than an io.Reader plus a way to rediscover it.
-func (s *store) sealPart(part *multipart.Part) error {
+// sealPart streams one multipart file part into the store, padded, or unpadded
+// if plain is set. The caller has already established that the part carries a
+// filename, so the concrete type comes in rather than an io.Reader plus a way
+// to rediscover it.
+func (s *store) sealPart(part *multipart.Part, plain bool) error {
 	name := part.FileName()
 	if len(name) > maxNameLen {
 		name = name[:maxNameLen]
@@ -320,7 +356,15 @@ func (s *store) sealPart(part *multipart.Part) error {
 	// The digest is taken as the bytes go past, so verifying a later download
 	// costs no second pass and no copy of the plaintext.
 	sum := sha256.New()
-	n, err := s.scheme.SealStreamAAD(s.masterKey, dst, io.TeeReader(part, sum), s.aad(id))
+	src := io.TeeReader(part, sum)
+	var n int64
+	if plain {
+		n, err = s.scheme.SealStreamAAD(s.masterKey, dst, src, s.aad(id))
+	} else {
+		// dst is a fresh *os.File, so chunk 0 can be written last, once the
+		// length it carries is known.
+		n, err = s.scheme.SealPaddedAtAAD(s.masterKey, dst, src, s.aad(id))
+	}
 	if cerr := dst.Close(); err == nil {
 		err = cerr
 	}
@@ -336,15 +380,15 @@ func (s *store) sealPart(part *multipart.Part) error {
 		return err
 	}
 	s.add(object{
-		ID: id, Name: name, Plain: n, Sealed: info.Size(),
+		ID: id, Name: name, Padded: !plain, Plain: n, Sealed: info.Size(),
 		Digest: hex.EncodeToString(sum.Sum(nil)), When: time.Now(),
 	})
+	logChunks(id, info.Size())
 	return nil
 }
 
 // uploadRaw takes the file as the whole request body, where Content-Length is
-// exact. That is the one upload shape where padding works on the request path,
-// which is why large-file APIs prefer it to multipart.
+// exact, so it pads with SealPaddedStreamAAD, which checks the body against it.
 func (s *store) uploadRaw(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength < 0 {
 		http.Error(w, "need a Content-Length; chunked bodies cannot be padded on the request path", http.StatusLengthRequired)
@@ -399,6 +443,7 @@ func (s *store) uploadRaw(w http.ResponseWriter, r *http.Request) {
 		ID: id, Name: name, Padded: true, Plain: n, Sealed: info.Size(),
 		Digest: hex.EncodeToString(sum.Sum(nil)), When: time.Now(),
 	})
+	logChunks(id, info.Size())
 	fmt.Fprintf(w, "sealed %s as %s: %d payload bytes -> %d on disk (padded)\n", name, id, n, info.Size())
 }
 
@@ -468,6 +513,7 @@ func (s *store) pad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sealed = info.Size() // the deferred endPad records it
+	logChunks(id, sealed)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -557,13 +603,15 @@ var indexTmpl = template.Must(template.New("index").Parse(`<!doctype html>
  .plain{background:#fde9c8}.padded{background:#cfe9cf}
 </style>
 <h1>envelope streaming upload</h1>
-<p>A multipart upload states no length, so it is sealed <b>unpadded</b>. Pad it
-afterwards and watch the size snap to a Padm&eacute; bucket. Nothing is ever
-written to disk as plaintext.</p>
+<p>A multipart upload states no length, but it lands in a file, so it is sealed
+<b>padded</b> anyway: chunk 0, which carries the length, is written last. Upload
+it <b>plain</b> to pad it afterwards and watch the size snap to a Padm&eacute;
+bucket. Nothing is ever written to disk as plaintext.</p>
 
 <form method="post" action="/upload" enctype="multipart/form-data">
   <input type="file" name="file" required>
-  <button type="submit">upload</button>
+  <button type="submit">upload padded</button>
+  <button type="submit" formaction="/upload?plain=1">upload plain</button>
 </form>
 
 <table>

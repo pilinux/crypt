@@ -343,7 +343,8 @@ with `go run ./_example/<name>`:
   ([server.go](_example/envelope/server.go)) instead, which pushes a real file
   of your choosing through the streaming and padding APIs. It caps uploads at
   1 GiB and keeps ciphertext in a temp dir; `-max 0 -dir /path` lifts both,
-  which is what a multi-gigabyte test needs. Verified at 5 GB, with the server
+  which is what a multi-gigabyte test needs; `-chunk` sets the chunk size
+  (default 1 MiB) and `-debug` logs how each padded upload is sealed. Verified at 5 GB, with the server
   sitting at 8.9 MiB resident.
 
 ## Generate RSA keys

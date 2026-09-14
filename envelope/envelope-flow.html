@@ -825,8 +825,8 @@
     Cut into chunks, seal each one
   </div>
   <div class="a step-sub" style="left: 653px; top: 1079px">
-    nonce = prefix(15) ‖ counter(8) ‖ final(1)<br />every chunk: header ‖
-    SHA-256(tag ‖ your AAD)
+    nonce = prefix(15) ‖ counter(8) ‖ final(1)<br />AD = header ‖ SHA-256(len ‖
+    format tag ‖ your AAD)<br />format tag = "pilinux/crypt/envelope:stream:v1"
   </div>
 
   <div class="a caption" style="left: 619px; top: 1214px">
@@ -854,7 +854,7 @@
   </div>
 
   <div class="a caption" style="left: 619px; top: 1297px">
-    then one sealed chunk after another
+    then one sealed chunk after another; tag = 16-byte Poly1305 MAC
   </div>
   <div
     class="a chips"
@@ -901,7 +901,7 @@
     Frame the payload
   </div>
   <div class="a step-sub" style="left: 1182px; top: 957px">
-    0x01 ‖ realLen(8) ‖ payload
+    0x01 ‖ realLen(8) ‖ payload, framed once, in chunk 0
   </div>
 
   <div
@@ -934,10 +934,10 @@
     3
   </div>
   <div class="a step-title" style="left: 1182px; top: 1056px">
-    Seal it under the padded tag
+    Seal it under the padded format tag
   </div>
   <div class="a step-sub" style="left: 1182px; top: 1079px">
-    same 0x81 bytes on disk, its own AAD binding
+    format tag = "pilinux/crypt/envelope:padded:v1"
   </div>
 
   <div
@@ -959,7 +959,7 @@
   </div>
 
   <div class="a caption" style="left: 1148px; top: 1214px">
-    what those chunks encrypt
+    one plaintext cut into chunks: only chunk 0 starts with the frame
   </div>
   <div
     class="a chips"
@@ -1003,7 +1003,7 @@
       line-height: 16px;
     "
   >
-    sealed by the streaming path → same 0x81 file, padded tag
+    sealed by the streaming path → same 0x81 file, padded format tag
   </div>
 
   <div class="a p-note" style="left: 1148px; top: 1341px; width: 445px">

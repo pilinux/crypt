@@ -25,6 +25,8 @@ import (
 	"math"
 	"math/bits"
 	"os"
+
+	"github.com/pilinux/crypt/internal/trace"
 )
 
 const (
@@ -249,6 +251,8 @@ func (s *Scheme) SealPaddedAtAAD(masterKey []byte, dst io.WriterAt, src io.Reade
 
 	head := make([]byte, c, c+TagSize)
 	defer Zero(head)
+	head[0] = paddingVersion
+	traceAt(trace.Event{Step: "chunk 0 created, length blank", HeldBack: true, Data: head[:paddingFrameSize]})
 	h, err := readFull(src, head[paddingFrameSize:])
 	n := int64(h)
 	if err == nil {
@@ -271,9 +275,9 @@ func (s *Scheme) SealPaddedAtAAD(masterKey []byte, dst io.WriterAt, src io.Reade
 		}
 	}
 
-	head[0] = paddingVersion
 	binary.BigEndian.PutUint64(head[1:paddingFrameSize], uint64(n)) // #nosec G115 -- n >= 0
 	clear(head[paddingFrameSize+h:])                                // src may have scribbled past h
+	traceAt(trace.Event{Step: "chunk 0 length set", HeldBack: true, Data: head[:paddingFrameSize]})
 
 	final := target <= int64(c)
 	if !final {
@@ -282,11 +286,59 @@ func (s *Scheme) SealPaddedAtAAD(masterKey []byte, dst io.WriterAt, src io.Reade
 		}
 	}
 	streamNonce(w.nonce[:], w.prefix, 0, final)
-	chunk := w.aead.Seal(head[:0], w.nonce[:], head[:min(target, int64(c))], w.aad)
+	plain := head[:min(target, int64(c))]
+	// w.counter is the chunk count once the writer is closed, or 1 if it never
+	// sealed one, so w.counter-1 chunks were sealed before this one.
+	ev := trace.Event{Final: final, HeldBack: true, Before: w.counter - 1}
+	show := frameShow(plain)
+	traceSeal(ev, plain, show)
+	chunk := w.aead.Seal(head[:0], w.nonce[:], plain, w.aad)
+	ev.Sealed = true
+	traceSeal(ev, chunk, show)
 	if err := writeAll(io.NewOffsetWriter(dst, streamHeaderSize), chunk); err != nil {
 		return n, err
 	}
 	return n, nil
+}
+
+// traceAt hands a padded-sealer step to the module-internal debug hook, if one
+// is set. Data and Tag are copied, so the hook cannot touch what is sealed.
+func traceAt(ev trace.Event) {
+	if trace.Hook != nil {
+		ev.Data = bytes.Clone(ev.Data)
+		ev.Tag = bytes.Clone(ev.Tag)
+		trace.Hook(ev)
+	}
+}
+
+// traceSeal reports a chunk just before Seal, when b is its plaintext, or just
+// after, when b is ciphertext || tag. For chunk 0 it shows the first show bytes.
+func traceSeal(ev trace.Event, b []byte, show int) {
+	if trace.Hook == nil {
+		return
+	}
+	ev.Step = "sealing"
+	if ev.Sealed {
+		ev.Step = "sealed"
+		ev.Tag = b[len(b)-TagSize:]
+	}
+	if ev.Index == 0 {
+		ev.Data = b[:show]
+	}
+	traceAt(ev)
+}
+
+// frameShow is how much of chunk 0's plaintext a trace shows: the frame and up
+// to 4 payload bytes, never the padding behind a shorter payload.
+func frameShow(plain []byte) int {
+	if len(plain) < paddingFrameSize {
+		return len(plain)
+	}
+	show := min(len(plain)-paddingFrameSize, 4)
+	if n := binary.BigEndian.Uint64(plain[1:paddingFrameSize]); n < uint64(show) { // #nosec G115 -- show is 0..4
+		show = int(n) // #nosec G115 -- n < show <= 4
+	}
+	return paddingFrameSize + show
 }
 
 // PaddedReader pulls the payload out of a stream sealed by

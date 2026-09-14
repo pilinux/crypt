@@ -21,18 +21,21 @@
 //	version(1) || realLen(8) || payload || zero padding   (all inside the stream)
 //
 // Padding needs that length before the first chunk is sealed, which an HTML
-// multipart upload cannot supply. The last section shows the way around it:
-// seal the upload unpadded, since that needs no length at all, and pad it in a
+// multipart upload cannot supply. Into a file, SealPaddedAt gets around it by
+// sealing chunk 0 last; otherwise the last section shows the way: seal the
+// upload unpadded, since that needs no length at all, and pad it in a
 // background pass once the length is known.
 //
 // Run with -serve to skip the demos and start the upload server in server.go
-// instead, for trying the same flow by hand with a real file:
+// instead, for trying both by hand with a real file:
 //
 //	go run ./_example/envelope -serve 127.0.0.1:8080
 //
 // -max raises or removes the upload cap and -dir picks the storage directory,
 // which is what a multi-gigabyte test needs: the library has no size ceiling,
-// but a demo server with a default cap and a temp dir does.
+// but a demo server with a default cap and a temp dir does. -chunk sets the
+// chunk size new objects are sealed with (default 1 MiB), and -debug logs how
+// each padded upload is sealed.
 //
 //	go run ./_example/envelope -serve 127.0.0.1:8080 -max 0 -dir /tmp/enc
 package main
@@ -61,9 +64,11 @@ func main() {
 	addr := flag.String("serve", "", "run the upload server on this address instead of the demos, e.g. 127.0.0.1:8080")
 	dir := flag.String("dir", "", "where the server keeps ciphertext (default: a fresh temp dir)")
 	limit := flag.Int64("max", defaultMaxUpload, "largest upload the server accepts, in bytes; 0 for no limit")
+	chunk := flag.Int("chunk", envelope.DefaultChunkSize, "chunk size in bytes the server seals new objects with, 1024..67108864")
+	debug := flag.Bool("debug", false, "log how padded uploads are sealed, payload length and first bytes included")
 	flag.Parse()
 	if *addr != "" {
-		if err := serve(*addr, *dir, *limit); err != nil {
+		if err := serve(*addr, *dir, *limit, *chunk, *debug); err != nil {
 			fmt.Println("server:", err)
 			os.Exit(1)
 		}

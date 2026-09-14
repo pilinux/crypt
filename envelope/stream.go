@@ -35,6 +35,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/pilinux/crypt/internal/trace"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -354,6 +355,7 @@ type StreamWriter struct {
 	next    [1]byte         // ReadFrom look-ahead; a field, so it is not allocated per chunk
 	counter uint64          // big-endian chunk counter in the nonce
 	closed  bool            // true after Close or Abort, so a second call is a no-op
+	padded  bool            // a padded stream: its first and last chunk reach the debug hook
 	err     error           // sticky: a failed chunk, a failed source or an Abort
 }
 
@@ -416,6 +418,10 @@ func (s *Scheme) sealWriter(masterKey []byte, dst io.Writer, tag string, aad []b
 	if err := writeAll(dst, header); err != nil {
 		return nil, err
 	}
+	padded := tag == paddedStreamTag
+	if padded {
+		traceAt(trace.Event{Step: "header written", Data: header})
+	}
 
 	return &StreamWriter{
 		dst:    dst,
@@ -423,6 +429,7 @@ func (s *Scheme) sealWriter(masterKey []byte, dst io.Writer, tag string, aad []b
 		aad:    streamAuthData(header, tag, aad),
 		prefix: prefix,
 		buf:    make([]byte, chunkSize, chunkSize+TagSize),
+		padded: padded,
 	}, nil
 }
 
@@ -574,7 +581,20 @@ func (w *StreamWriter) state() error {
 func (w *StreamWriter) seal(final bool) error {
 	streamNonce(w.nonce[:], w.prefix, w.counter, final)
 
+	// A padded stream's first and last chunk go to the debug hook, if one is set.
+	traced := w.padded && trace.Hook != nil && (w.counter == 0 || final)
+	ev, show := trace.Event{Index: w.counter, Final: final}, 0
+	if traced {
+		if w.counter == 0 {
+			show = frameShow(w.buf[:w.n])
+		}
+		traceSeal(ev, w.buf[:w.n], show)
+	}
 	chunk := w.aead.Seal(w.buf[:0], w.nonce[:], w.buf[:w.n], w.aad)
+	if traced {
+		ev.Sealed = true
+		traceSeal(ev, chunk, show)
+	}
 	if err := writeAll(w.dst, chunk); err != nil {
 		return w.fail(err)
 	}
