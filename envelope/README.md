@@ -2,83 +2,132 @@
 
 Envelope encryption on top of the root `crypt` primitives.
 
-Key model: `secret --HKDF--> KEK --wraps--> master key --HKDF+salt--> per-item sub-key --> XChaCha20-Poly1305`.
-
-Two formats, told apart by the first byte:
+![Diagram: the key ladder, the three ways to seal (single-shot, streaming, padded stream), and the open path that mirrors them](envelope-flow.png)
 
 ```text
 envelope (0x01): version(1) || saltLen(1) || salt(16) || nonce(24) || ciphertext || tag(16)
 stream   (0x81): version(1) || saltLen(1) || salt(16) || chunkSize(4 BE) || noncePrefix(15) || chunk...
+
+secret --HKDF--> KEK --wraps--> master key --HKDF + salt--> sub-key --> XChaCha20-Poly1305
 ```
 
-Header (plus caller AAD) is authenticated as AEAD additional data in both. A
-stream can carry a padded payload (`version(1) || realLen(8) || payload ||
-zeros`, sealed inside the stream) so the file size stops revealing the exact
-plaintext length.
+## Contents
 
-![Diagram: the key ladder, the three ways to seal (single-shot, streaming, padded stream), and the open path that mirrors them](envelope-flow.png)
+- [crypt/envelope](#cryptenvelope)
+  - [Contents](#contents)
+  - [Quick start](#quick-start)
+  - [Which function](#which-function)
+  - [Keys](#keys)
+  - [Wire format](#wire-format)
+    - [Wrapped master key (72 bytes)](#wrapped-master-key-72-bytes)
+    - [Single-shot envelope (version `0x01`)](#single-shot-envelope-version-0x01)
+    - [Streaming format (version `0x81`)](#streaming-format-version-0x81)
+    - [Padded stream](#padded-stream)
+  - [Errors](#errors)
+  - [Rules worth knowing](#rules-worth-knowing)
+  - [What the ciphertext reveals](#what-the-ciphertext-reveals)
+  - [Source files](#source-files)
 
-The whole scheme on one page: derive the KEK and unwrap the master key, seal
-an item, a stream or a padded stream, then walk the same ladder backwards to
-open it.
+## Quick start
 
-[**Wire format**](#wire-format): the complete byte layout of both formats, with worked examples.
+```go
+scheme := envelope.New(envelope.Config{
+	KEKLabel:    "myapp:kek:v1",         // frozen: changing it orphans data
+	SubKeyLabel: "myapp:data-subkey:v1", // frozen too
+})
 
-Files: [`envelope.go`](#envelopego) · [`keys.go`](#keysgo) · [`cipher.go`](#ciphergo) · [`stream.go`](#streamgo) · [`file.go`](#filego) · [`padding.go`](#paddinggo) · [`exactreader.go`](#paddinggo) · [`hash.go`](#hashgo) · [tests](#test-files)
+// Once: generate the master key and store it wrapped.
+kek, err := scheme.DeriveKEK(secret) // secret: >= 32 machine-random bytes
+masterKey, err := envelope.GenerateMasterKey()
+wrapped, err := envelope.WrapKey(kek, masterKey) // persist this
+envelope.Zero(kek)
 
----
+// Every start: derive the KEK again and unwrap. ErrEnvelopeAuth means the secret changed.
+kek, err = scheme.DeriveKEK(secret)
+masterKey, err = envelope.UnwrapKey(kek, wrapped)
+envelope.Zero(kek)
 
-## Wire format
+// Small values. The AAD ties a token to its row, so tokens cannot be swapped.
+aad := []byte("user:42:email")
+token, err := scheme.SealStringAAD(masterKey, "alice@example.com", aad)
+email, err := scheme.OpenStringAAD(masterKey, token, aad)
+```
 
-Every byte the scheme puts on the wire, field by field. All sizes are bytes,
-all multi-byte integers are big-endian, and every hex value below comes from a
-real run (`go run ./_example/envelope` prints the same dumps, with fresh
-random values each time).
+## Which function
 
-### Key hierarchy
+| You have | Seal with | Open with |
+| --- | --- | --- |
+| a string, `[]byte` or `int64` | `SealString`, `SealBytes`, `SealInt64` | `OpenString`, `OpenBytes`, `OpenInt64` |
+| a file | `SealFile` | `OpenFile` |
+| an `io.Reader` / `io.Writer` | `SealStream`, or `SealWriter` | `OpenStream`, or `OpenReader` |
+| a file whose size must stay hidden | `SealPaddedFile` | `OpenPaddedFile` |
+| a reader of known size, size hidden | `SealPaddedStream` | `OpenPaddedStream`, or `OpenPaddedReader` |
+| a reader of unknown size, into an `io.WriterAt` such as a file | `SealPaddedAt` | `OpenPaddedStream`, or `OpenPaddedReader` |
 
-Both formats share one key ladder. Only the leaf key ever touches user data.
+```go
+// Files. The destination must not exist yet; a partial one is removed on error.
+n, err := scheme.SealFileAAD(masterKey, "report.pdf.enc", "report.pdf", aad)
+n, err = scheme.OpenFileAAD(masterKey, "report.opened.pdf", "report.pdf.enc", aad)
 
-| Value | Size | Produced by | Lives where |
+// Writer and reader.
+w, err := scheme.SealWriterAAD(masterKey, dst, aad)
+defer w.Abort()          // no-op once Close has succeeded
+if _, err := io.Copy(w, src); err != nil {
+	return err           // check it: see "Only Close completes a stream" below
+}
+err = w.Close()          // the only thing that completes a stream
+
+r, err := scheme.OpenReaderAAD(masterKey, src, aad)
+defer r.Abort()          // wipes the decrypted chunk if you stop early
+_, err = io.Copy(dst, r)
+
+// Padded, with the payload size known before the body (Content-Length).
+pr, err := scheme.OpenPaddedReaderAAD(masterKey, src, aad)
+length := pr.Size()
+_, err = io.Copy(dst, pr)
+err = pr.Close()         // nil: payload complete and padding authentic
+```
+
+## Keys
+
+| Key | Size | Produced by | Lives where |
 | --- | --- | --- | --- |
 | Application secret | >= 32 bytes (`MinSecretLength`) | your own randomness, e.g. `openssl rand -hex 32` | env var / secret manager, never on the wire |
 | KEK | 32 (`KeySize`) | `HKDF-SHA256(ikm = secret, salt = nil, info = KEKLabel)` | memory only, `Zero` it after wrapping |
-| Master key (DEK) | 32 | `crypto/rand`, generated once ever | stored *wrapped*, see [1](#1-wrapped-master-key-at-rest) |
-| Per-item sub-key | 32 | `HKDF-SHA256(ikm = masterKey, salt = 16-byte item salt, info = SubKeyLabel)` | memory only, wiped on return (`defer Zero`) |
-| Per-stream sub-key | 32 | same HKDF, **once per stream**, never per chunk | inside the AEAD for the stream's lifetime |
+| Master key (DEK) | 32 | `crypto/rand`, generated once ever | stored *wrapped* under the KEK |
+| Item sub-key | 32 | `HKDF-SHA256(ikm = masterKey, salt = 16-byte random salt, info = SubKeyLabel)` | one per sealed value, wiped internally |
+| Stream sub-key | 32 | the same derivation, run **once per stream**, never per chunk | inside the AEAD for the stream's lifetime |
 
-- Public on the wire: version byte, salt length, salt, nonce (or nonce prefix), chunk size, ciphertext, tags.
-- Never on the wire: the secret, the KEK, the master key in the clear, any sub-key, the HKDF labels, and the caller-supplied AAD.
+Never on the wire: the secret, the KEK, the unwrapped master key, sub-keys, labels
+and the caller's AAD.
 
-### 1. Wrapped master key (at rest)
+## Wire format
+
+Sizes in bytes, integers big-endian.
+
+### Wrapped master key (72 bytes)
 
 `WrapKey(kek, masterKey)` is a plain
 `crypt.EncryptByteXChacha20poly1305WithNonceAppended` call: no envelope header,
 no version byte, no AAD. This is the one value you persist alongside your data.
 
-| Offset | Field | Size | Content |
-| --- | --- | --- | --- |
-| 0 | nonce | 24 | random, fresh on every wrap |
-| 24 | ciphertext | 32 | the master key, encrypted under the KEK |
-| 56 | tag | 16 | Poly1305 |
-| | **total** | **72** | fixed, always |
+```text
+nonce(24) || ciphertext(32) || tag(16)      no header, no AAD
+```
 
-Example (hex):
-
-| Part | Value |
+| Part | Example |
 | --- | --- |
-| KEK (not stored) | `4a70898149320291f112d82f27de499623ec674fa78bcd24faa1f52e7c8c431d` |
-| master key (not stored) | `a81998575dbf4d61208267a180ef3adf0ce5deb5645c16537de66382ff4a56b4` |
+| KEK | `4a70898149320291f112d82f27de499623ec674fa78bcd24faa1f52e7c8c431d` |
+| master key | `a81998575dbf4d61208267a180ef3adf0ce5deb5645c16537de66382ff4a56b4` |
 | nonce | `292a54a73ab81b36fae84305315e352b02832e5f3e3262e6` |
 | ciphertext | `6b967eab91be966c974d7da3215716c3429ce4463d11434b1ca141161bfe21bd` |
 | tag | `2670c07f7df390442716129b886f9f74` |
 | stored blob (base64) | `KSpUpzq4Gzb66EMFMV41KwKDLl8+MmLma5Z+q5G+lmyXTX2jIVcWw0Kc5EY9EUNLHKFBFhv+Ib0mcMB/ffOQRCcWEpuIb590` |
 
-### 2. Single-shot envelope (version `0x01`)
+### Single-shot envelope (version `0x01`)
 
-Produced by `SealBytes` / `SealString` / `SealInt64` and their `*AAD` variants.
-The whole item is held in memory, sealed under **its own sub-key**, with **one
-random nonce**.
+`SealBytes`, `SealString`, `SealInt64`: the whole value in memory, one sub-key
+and one random nonce per value.
 
 ```text
 ┌─────────┬─────────┬──────┬───────┬────────────────┬─────┐
@@ -86,98 +135,62 @@ random nonce**.
 │    1    │    1    │  16  │   24  │ len(plaintext) │  16 │
 └─────────┴─────────┴──────┴───────┴────────────────┴─────┘
 └────── header (18) ───────┘└─ XChaCha20-Poly1305 output ─┘
+
+key = HKDF-SHA256(masterKey, salt, SubKeyLabel)
+AD  = header || aad
 ```
 
-| Offset | Field | Size | Value | Set by |
-| --- | --- | --- | --- | --- |
-| 0 | version | 1 | `0x01` (`envelopeVersion`) | `buildHeader` |
-| 1 | saltLen | 1 | `0x10` = 16 | `buildHeader` |
-| 2 | salt | 16 (`SaltSize`) | fresh `crypto/rand` per item | `GenerateSalt` |
-| 18 | nonce | 24 (`NonceSize`) | fresh `crypto/rand` per item | root `crypt` helper |
-| 42 | ciphertext | `len(plaintext)` | XChaCha20 keystream XOR plaintext | AEAD |
-| 42 + n | tag | 16 (`TagSize`) | Poly1305 over ciphertext + AAD | AEAD |
-
-The reader (`unpackEnvelope`) requires `saltLen` to be exactly `SaltSize`,
-since that is the only length the writer emits and the only one `DeriveSubKey`
-accepts. A blob shorter than `2 + 16 + 24 + 16` cannot be authentic either.
-Both are `ErrBadEnvelope`, reported before any key is derived: they describe
-untrusted wire data, not a caller's argument, which is what `ErrInvalidSaltSize`
-is for.
-
-#### What the AEAD actually gets
-
-| AEAD input | Value | Notes |
-| --- | --- | --- |
-| key | per-item sub-key (32) | `HKDF-SHA256(masterKey, salt, SubKeyLabel)`, wiped after the call |
-| nonce | 24 random bytes | safe at random: XChaCha20's 192-bit nonce makes collisions negligible, and the sub-key is unique per item anyway |
-| plaintext | the item | |
-| additional data | `header (18) \|\| callerAAD` (`authData`) | authenticated, **not** encrypted, and the caller AAD is **not stored** |
-
-#### Encrypted, authenticated, or neither
-
-| Component | Encrypted | Authenticated | Travels on the wire |
+| Offset | Field | Size | Value |
 | --- | --- | --- | --- |
-| version, saltLen, salt | no | yes, as the leading AAD bytes | yes |
-| nonce | no | implicitly: change it and the tag stops verifying | yes |
-| caller AAD (record ID, field name, ...) | no | yes | **no**, you must re-supply the identical bytes to open |
-| plaintext | yes | yes | as ciphertext |
-| tag | n/a | n/a | yes |
+| 0 | version | 1 | `0x01` |
+| 1 | saltLen | 1 | `0x10`, anything else is `ErrBadEnvelope` |
+| 2 | salt | 16 | random per value |
+| 18 | nonce | 24 | random per value |
+| 42 | ciphertext | n | |
+| 42+n | tag | 16 | |
 
-#### Sizes
-
-| Quantity | Formula | Worked value |
+| Size | Formula | Example |
 | --- | --- | --- |
-| envelope blob | `58 + len(plaintext)` | 17-byte string → 75 |
-| base64 token (`SealString`) | `4 * ceil((58 + n) / 3)` chars | 75 → 100 chars |
-| int64 blob | `58 + 8 = 66`, always | token is always 88 chars |
-| overhead | 58 bytes flat | 40 of those bytes are salt + nonce, 16 the tag, 2 the version/saltLen pair |
+| blob | `58 + n` | 17-byte string: 75 |
+| base64 token | `4 * ceil((58 + n) / 3)` chars | 100 chars |
+| `int64` token | always 66 bytes, 88 chars | the value is 8 bytes big-endian, so the size never leaks it |
 
-`SealInt64` writes the value as fixed-width 8-byte big-endian two's complement,
-so `1` and `-9223372036854775808` produce byte-identical token lengths and the
-magnitude cannot leak.
+Both examples use the master key above and the Quick start labels
+(`SubKeyLabel` = `myapp:data-subkey:v1`), so they open with those values.
 
-#### Example rows
-
-Sealing the string `alice@example.com` (17 bytes) under the master key above:
+`SealStringAAD(masterKey, "alice@example.com", []byte("user:42:email"))`, a
+17-byte string:
 
 | Field | Size | Value |
 | --- | --- | --- |
 | version | 1 | `01` |
 | saltLen | 1 | `10` (= 16) |
-| salt | 16 | `2d63c25c4e0f9e0215382a8ada3032d2` |
-| nonce | 24 | `66e99fcefa0abcd1733a401415288ab300698d9048c13f00` |
-| ciphertext | 17 | `9f3f5b7a8f469be8e306c8459889b5f946` |
-| tag | 16 | `316aa610b5858ac4555e8a5b4488391d` |
-| blob | 75 | `01102d63c25c4e0f9e0215382a8ada3032d266e99fcefa0abcd1733a401415288ab300698d9048c13f009f3f5b7a8f469be8e306c8459889b5f946316aa610b5858ac4555e8a5b4488391d` |
-| token | 100 chars | `ARAtY8JcTg+eAhU4KoraMDLSZumfzvoKvNFzOkAUFSiKswBpjZBIwT8Anz9beo9Gm+jjBshFmIm1+UYxaqYQtYWKxFVeiltEiDkd` |
+| salt | 16 | `ac2d87c6417da6983652b7ee79ed0870` |
+| nonce | 24 | `b7af08ca1ce210951f0267149ddcaebbe4f5625d94141c30` |
+| ciphertext | 17 | `c855a85043da64d4d14461d66933714102` |
+| tag | 16 | `13fd87417a048d093d2b99251ee4874e` |
+| blob | 75 | `0110ac2d87c6417da6983652b7ee79ed0870b7af08ca1ce210951f0267149ddcaebbe4f5625d94141c30c855a85043da64d4d14461d6693371410213fd87417a048d093d2b99251ee4874e` |
+| token | 100 chars | `ARCsLYfGQX2mmDZSt+557Qhwt68IyhziEJUfAmcUndyuu+T1Yl2UFBwwyFWoUEPaZNTRRGHWaTNxQQIT/YdBegSNCT0rmSUe5IdO` |
 
-Sealing the integer `42` with the same master key:
+`SealInt64(masterKey, 42)`, no AAD:
 
 | Field | Size | Value |
 | --- | --- | --- |
-| version, saltLen | 2 | `01 10` |
-| salt | 16 | `df8470903d2a31cf0d15168d3de6ff9b` |
-| nonce | 24 | `bc2c3928b66cb8f6f26efd2046e0e49999eca991e9591b85` |
-| ciphertext | 8 | `e267784fb0b28538` (the plaintext is `000000000000002a`) |
-| tag | 16 | `0b6f3858dbb271a52692d2955420e2ca` |
-| token | 88 chars | `ARDfhHCQPSoxzw0VFo095v+bvCw5KLZsuPbybv0gRuDkmZnsqZHpWRuF4md4T7CyhTgLbzhY27JxpSaS0pVUIOLK` |
+| version | 1 | `01` |
+| saltLen | 1 | `10` (= 16) |
+| salt | 16 | `4589b01af706ab5ba6dcfe2fe9e352f1` |
+| nonce | 24 | `153db20803b79f798ff2e19ad2da262b78b183c825af2687` |
+| ciphertext | 8 | `dc71d1cac75dd5e0` (the plaintext is `000000000000002a`) |
+| tag | 16 | `9a798d9bcb498de34176af4bab77ac8a` |
+| token | 88 chars | `ARBFibAa9warW6bc/i/p41LxFT2yCAO3n3mP8uGa0tomK3ixg8glryaH3HHRysdd1eCaeY2by0mN40F2r0urd6yK` |
 
-Sealing the *same* plaintext twice gives a different salt, hence a different
-sub-key, hence a different nonce and a completely different blob:
+Sealing the same value twice gives a new salt and nonce, so equal plaintexts
+never produce equal tokens.
 
-| Run | salt | nonce |
-| --- | --- | --- |
-| 1 | `06b6d7e597625d246eb8d03137f6511f` | `50b0bf72fcfcfee8d4d07938c6005e4ddc7f279759771c73` |
-| 2 | `bdf03c0ca5c6290b16f7f3cc76c48602` | `6f9bb015542bc74d3f5c0659a83e81b2781912a13aababc2` |
+### Streaming format (version `0x81`)
 
-There is no deterministic mode: equal plaintexts are never equal ciphertexts,
-so the datastore leaks no equality information.
-
-### 3. Streaming format (version `0x81`)
-
-Produced by `SealWriter` / `SealStream` / `SealFile` and their `*AAD` variants.
-The input is cut into fixed-size plaintext chunks and each chunk becomes its own
-AEAD message. Memory stays at one chunk no matter how large the input is.
+`SealStream`, `SealWriter`, `SealFile`: memory stays at one chunk whatever the
+input size.
 
 ```text
 ┌─────────┬─────────┬──────┬───────────┬─────────────┐┌─────────┬─────────┬─────┬───────────┐
@@ -185,97 +198,44 @@ AEAD message. Memory stays at one chunk no matter how large the input is.
 │    1    │    1    │  16  │     4     │      15     ││  ct+tag │  ct+tag │     │   ct+tag  │
 └─────────┴─────────┴──────┴───────────┴─────────────┘└─────────┴─────────┴─────┴───────────┘
 └─── header (37), authenticated with every chunk ────┘└──── one Poly1305 tag per chunk ─────┘
-```
 
-#### Header
+header(37) || chunk 0 || chunk 1 || ... || chunk N-1
+
+header = version(1) || saltLen(1) || salt(16) || chunkSize(4) || noncePrefix(15)
+chunk  = ciphertext(chunkSize, the last one may be shorter) || tag(16)
+
+key    = HKDF-SHA256(masterKey, salt, SubKeyLabel)      once per stream
+nonce  = noncePrefix(15) || counter(8) || final(1)      per chunk: final = 0x01 on the last one
+AD     = header || SHA-256(len(tag)(8) || tag || aad)   computed once, identical for every chunk
+```
 
 | Offset | Field | Size | Value |
 | --- | --- | --- | --- |
-| 0 | version | 1 | `0x81` (`streamVersion`), high bit set so it can never be mistaken for `0x01` |
-| 1 | saltLen | 1 | `0x10` = 16, and the reader requires exactly 16 here |
-| 2 | salt | 16 | fresh `crypto/rand`, **one per stream** |
-| 18 | chunkSize | 4 | big-endian uint32, plaintext bytes per chunk, must be in `MinChunkSize (1 KiB) .. MaxChunkSize (64 MiB)` |
-| 22 | noncePrefix | 15 | fresh `crypto/rand`, **one per stream** |
-| | **total** | **37** | `streamHeaderSize` |
+| 0 | version | 1 | `0x81` (the high bit keeps it apart from `0x01`) |
+| 1 | saltLen | 1 | `0x10` |
+| 2 | salt | 16 | random per stream |
+| 18 | chunkSize | 4 | `MinChunkSize` (1 KiB) .. `MaxChunkSize` (64 MiB), default 1 MiB |
+| 22 | noncePrefix | 15 | random per stream |
 
-The chunk size is read back **from the header**, never from the `Scheme`, so
-changing `Config.ChunkSize` later never orphans existing data. `MaxChunkSize`
-also bounds the buffer a hostile header can make a reader allocate.
+The `tag` in the AD is a format tag that is never stored:
+`pilinux/crypt/envelope:stream:v1` for plain streams,
+`pilinux/crypt/envelope:padded:v1` for padded ones. Neither reader opens the
+other's streams.
 
-#### Same key, different nonce: what changes per chunk
+**Size:** `37 + n + 16 * max(1, ceil(n / chunkSize))`, so a 10 GiB file at the
+default chunk size grows by 160 KiB. An exact multiple of the chunk size gets no
+empty extra chunk; empty input is one 16-byte chunk.
 
-This is the part that differs most from the single-shot format.
-
-| Per stream (derived once) | Per chunk (changes every chunk) |
-| --- | --- |
-| salt (16, random) | chunk counter, `0, 1, 2, ...` |
-| sub-key (32) = `HKDF-SHA256(masterKey, salt, SubKeyLabel)` | final flag, `0x00` until the last chunk, `0x01` on it |
-| nonce prefix (15, random) | the full 24-byte nonce built from those two |
-| AEAD instance (`chacha20poly1305.NewX(subKey)`) | the 16-byte tag |
-| additional data = `header (37) \|\| SHA-256(len(tag) \|\| tag \|\| callerAAD)` (`streamAuthData`) | |
-
-**Every chunk of one stream is sealed under the same sub-key.** There is no
-per-chunk HKDF, no per-chunk salt and no per-chunk random nonce. Uniqueness
-comes from the counter instead, which is exactly what makes chunk reordering
-detectable: a chunk's position is baked into its nonce. Across streams the keys
-differ anyway, since each stream draws its own salt.
-
-#### Chunk nonce (24 bytes)
-
-| Offset | Field | Size | Content |
-| --- | --- | --- | --- |
-| 0 | noncePrefix | 15 | from the header, constant for the stream |
-| 15 | counter | 8 | big-endian chunk index, starts at 0 |
-| 23 | final flag | 1 | `0x00` for every chunk but the last, `0x01` for the last |
-
-Nonce reuse is impossible within a stream (the counter increments) and
-practically impossible across streams (a fresh 15-byte prefix *and* a fresh
-salt, so a different key entirely).
-
-#### Chunk body
-
-| Part | Size | Notes |
+| n (1 KiB chunks) | Chunks | Sealed |
 | --- | --- | --- |
-| ciphertext | `chunkSize` for every chunk but the last | the last carries the remainder |
-| tag | 16 | one Poly1305 tag per chunk, appended by the AEAD |
-| chunk on the wire | `plaintext bytes + 16` | non-final chunks are always `chunkSize + 16` |
+| 0 | 1 | 53 |
+| 500 | 1 | 553 |
+| 1024 | 1 | 1077 |
+| 2048 | 2 | 2117 |
+| 2500 | 3 | 2585 |
 
-A chunk shorter than 16 bytes cannot even hold a tag and is rejected as
-`ErrBadStream`.
-
-#### How many chunks
-
-`chunks = max(1, ceil(n / chunkSize))`. The writer holds the trailing buffer
-back until it knows more data follows (a one-byte look-ahead), so an input that
-is an exact multiple of the chunk size does **not** get an extra empty final
-chunk; the last full buffer is simply flagged final. An empty input still
-produces one chunk: an authenticated 16-byte tag over zero bytes.
-
-Measured, with `chunkSize` = 1 KiB (`MinChunkSize`):
-
-| Plaintext `n` | Chunks | Plaintext per chunk | Sealed size | Breakdown |
-| --- | --- | --- | --- | --- |
-| 0 | 1 | 0 (final) | 53 | 37 + 0 + 16 |
-| 500 | 1 | 500 (final) | 553 | 37 + 500 + 16 |
-| 1024 | 1 | 1024 (final) | 1077 | 37 + 1024 + 16 |
-| 2048 | 2 | 1024, 1024 (final) | 2117 | 37 + 2048 + 2 × 16 |
-| 2500 | 3 | 1024, 1024, 452 (final) | 2585 | 37 + 2500 + 3 × 16 |
-
-#### Sizes and memory
-
-| Quantity | Formula | Worked value |
-| --- | --- | --- |
-| sealed size | `37 + n + 16 * chunks` | 2500 B at 1 KiB chunks → 2585 |
-| overhead | `37 + 16 * ceil(n / chunkSize)` | 10 GiB at the default 1 MiB chunk → 10240 tags = 160 KiB, about 0.0015% |
-| memory | one chunk buffer (`chunkSize + 16`), allocated once | 1 MiB by default, whatever the file size |
-
-Bigger chunks trade memory for less tag overhead. Nothing is allocated per
-chunk: both buffers are reused and every chunk is sealed and opened in place.
-
-#### Example: 2500 bytes at a 1 KiB chunk size
-
-Header (37 bytes),
-`811018f2250d998368c02f22874f359c0024000004006e759a18fea1a1621e3d6bbadd7fb0`:
+Example: 2500 random bytes, 1 KiB chunks,
+header `811018f2250d998368c02f22874f359c0024000004006e759a18fea1a1621e3d6bbadd7fb0`:
 
 | Field | Size | Value |
 | --- | --- | --- |
@@ -285,590 +245,148 @@ Header (37 bytes),
 | chunkSize | 4 | `00000400` (= 1024) |
 | noncePrefix | 15 | `6e759a18fea1a1621e3d6bbadd7fb0` |
 
-Chunks, all sealed under the one sub-key derived from that salt, all
-authenticating the same `header || "report.pdf"` AAD:
-
-| # | Plaintext | Nonce (prefix ‖ counter ‖ flag) | On the wire | Tag |
+| Chunk | Plaintext | Counter, flag | On the wire | Tag |
 | --- | --- | --- | --- | --- |
-| 0 | 1024 | `6e759a18fea1a1621e3d6bbadd7fb0` `0000000000000000` `00` | 1040 | `fda2e5a001286ea1b6376d9c0be018f2` |
-| 1 | 1024 | `6e759a18fea1a1621e3d6bbadd7fb0` `0000000000000001` `00` | 1040 | `24e06be6ade0c3ec2532c36254bce8d0` |
-| 2 | 452 | `6e759a18fea1a1621e3d6bbadd7fb0` `0000000000000002` `01` | 468 | `3007794b82748b1ccacc327b52a7253d` |
+| 0 | 1024 | `0000000000000000` `00` | 1040 | `fda2e5a001286ea1b6376d9c0be018f2` |
+| 1 | 1024 | `0000000000000001` `00` | 1040 | `24e06be6ade0c3ec2532c36254bce8d0` |
+| 2 | 452 | `0000000000000002` `01` | 468 | `3007794b82748b1ccacc327b52a7253d` |
 
-Total: 37 + 1040 + 1040 + 468 = 2585 bytes.
+Total: 37 + 1040 + 1040 + 468 = 2585.
 
-#### What each attack runs into
+| Tampering | Result |
+| --- | --- |
+| flip a bit, reorder, duplicate, drop or append chunks | `ErrStreamAuth` |
+| truncate | `ErrStreamAuth`: the last chunk read is not flagged final; `ErrBadStream` if the cut falls inside or right after the header, or 1 to 15 bytes into a chunk |
+| edit the header | `ErrStreamAuth`, or `ErrBadStream` / `ErrInvalidChunkSize` if it no longer parses |
+| wrong key or AAD | `ErrStreamAuth` |
+| envelope fed to a stream reader, or the reverse | `ErrBadStream` / `ErrBadEnvelope` |
 
-| Tampering | Detected by | Error |
-| --- | --- | --- |
-| flip a ciphertext bit | Poly1305 tag of that chunk | `ErrStreamAuth` |
-| edit any header byte (version, salt, chunk size, prefix) | header is AAD of every chunk | `ErrStreamAuth`, or `ErrBadStream` / `ErrInvalidChunkSize` if it no longer parses |
-| swap two chunks | counter is in the nonce | `ErrStreamAuth` |
-| duplicate a chunk | counter mismatch on the copy | `ErrStreamAuth` |
-| drop a chunk | every later counter is off by one | `ErrStreamAuth` |
-| truncate the stream | the last chunk read is not flagged final | `ErrStreamAuth`, never a clean EOF |
-| append extra chunks | the previously final chunk now decrypts with flag 0 | `ErrStreamAuth` |
-| open with the wrong AAD or master key | sub-key / AAD mismatch | `ErrStreamAuth` |
-| feed an envelope blob (`0x01`) to the stream reader | version byte | `ErrBadStream` |
-| feed a stream blob (`0x81`) to `OpenBytes` | version byte | `ErrBadEnvelope` |
+### Padded stream
 
-Plaintext is written out chunk by chunk as each chunk authenticates, so a
-stream that fails part-way has already produced output: treat the destination
-as unusable unless the call returns `nil`. `SealFile` / `OpenFile` remove the
-partial destination for you.
-
-### 4. Padded payloads (length hiding)
-
-Both formats above reveal the exact plaintext length. The padded pair closes
-that gap by framing and padding the payload *before* it reaches the stream
-sealer, so the padding is encrypted and authenticated like any other plaintext:
+A stream hides content, not length: its size gives `n` away. The padded forms
+frame and pad the payload inside an ordinary `0x81` stream.
 
 ```text
-on disk:   0x81 || saltLen || salt || chunkSize || noncePrefix || chunk...
-                                                       │
-                                    the chunks decrypt to ▼
-plaintext: 0x01 || realLen(8, big-endian) || payload || zero padding
+sealed plaintext = version(1)=0x01 || realLen(8) || payload || zeros
+padded length    = PaddedSize(n) = padme(9 + n)
+on disk          = 37 + PaddedSize(n) + 16 * ceil(PaddedSize(n) / chunkSize)
 ```
 
-The file itself is an ordinary `0x81` stream, unchanged. The `0x01` above is
-the first byte of the sealed *plaintext*, so it never appears in the clear and
-never meets `streamVersion`; it shares a value with `envelopeVersion`
-harmlessly, since the two are read from different places.
+Padmé keeps only the top `log2(log2(L))` bits of `L`, the frame plus the
+payload. The overhead on `L` is at most about 12% below 256 bytes, 6% below
+64 KiB and 3% below 4 GiB. On average it is about 3% on the Padmé paper's
+real-world datasets, and 1 to 2% for sizes spread evenly on a log scale from
+1 KB to 1 GB. On a tiny payload the 9-byte frame adds to that: 120 bytes pad to 144, 20%.
+Buckets are 2 KiB wide near 96 KB, 16 KiB near 1 MB, 16 MiB near 1 GB. Measured
+at 1 MiB chunks:
 
-| Offset | Field | Size | Value |
+| Payload | `PaddedSize` | Padded file | Unpadded file |
 | --- | --- | --- | --- |
-| 0 | version | 1 | `0x01` (`paddingVersion`), first byte of the plaintext, not of the file. A stream sealed without padding is rejected rather than decoded as data |
-| 1 | realLen | 8 | payload length as a big-endian uint64: 27 is `00 00 00 00 00 00 00 1b`. Fixed width, so the frame never hints at the size it carries |
-| 9 | payload | `realLen` | the file contents |
-| 9 + realLen | padding | to the bucket | zero bytes |
+| 94,500 | 96,256 | **96,309** | 94,553 |
+| 96,037 | 96,256 | **96,309** | 96,090 |
+| 96,200 | 96,256 | **96,309** | 96,253 |
+| 100,000 | 100,352 | 100,405 | 100,053 |
 
-**All padding goes at the tail.** Every chunk but the last is already exactly
-`chunkSize` bytes of plaintext by construction, and the chunk size is in the
-header, so interior chunks carry no length information and padding them would
-hide nothing. Whether the padding fills out the final chunk or adds whole
-chunks after it is just arithmetic on the bucket size.
-
-#### Three ways in, one format
-
-| Entry point | Source | Where the size comes from |
+| Sealer | Size from | Memory |
 | --- | --- | --- |
-| `SealPaddedStream[AAD](masterKey, dst, src, size, aad)` | any `io.Reader` | the `size` argument |
-| `SealPaddedFile[AAD](masterKey, dstPath, srcPath, aad)` | a path | `Stat` on the open handle |
-| `SealPaddedAt[AAD](masterKey, dst, src, aad)` | any `io.Reader`, into an `io.WriterAt` | counted while reading |
+| `SealPaddedStream(masterKey, dst, src, size)` | the `size` argument | one chunk |
+| `SealPaddedFile(masterKey, dstPath, srcPath)` | `Stat` on the open file | one chunk |
+| `SealPaddedAt(masterKey, dst, src)` | counted; chunk 0 is sealed last and written at offset 37 | two chunks |
 
-The file form is a `pipeFile` wrapper around the stream form, and
-`SealPaddedAt` writes the same format, so every opener reads all three.
-
-**Padding costs no memory and no scratch space.** The frame, the payload and
-the zero padding are stitched together with `io.MultiReader` and pulled through
-the ordinary chunk sealer as it asks for them: one chunk is buffered, the zeros
-are generated on demand by `zeroReader`, and the plaintext is never staged
-anywhere. A padded 10 GB upload seals exactly like an unpadded one.
-
-**The length is the one thing needed in advance.** `realLen` sits at the head
-of the plaintext, so it must be known before chunk 0 is sealed, and the Padmé
-bucket must be known before the padding is generated. A `Content-Length`, a
-`len()`, or the file form's `Stat` all supply it. A `src` that then delivers a
-different number of bytes fails with `ErrSourceSize` rather than producing a
-frame that lies about its payload; `SealPaddedFile` removes the partial
-destination for you, a stream caller must discard `dst` itself.
-
-**Unless `dst` can seek.** A chunk's nonce depends on its position, not on when
-it is sealed, so `SealPaddedAt` holds chunk 0 (where the frame lives) in memory,
-seals chunks 1 onward at their fixed offsets `37 + i*(chunkSize+16)`, and at
-`io.EOF` fills in the frame, seals chunk 0 exactly once and writes it at offset
-37. It costs a second chunk of memory, and with no declared size only `io.EOF`
-marks the payload complete.
-
-**When the length cannot be known up front and `dst` cannot seek, defer the padding.** An HTML
-multipart upload sends no per-part `Content-Length`, and the browser picks the
-file after the page loads, so nothing can state the length before the bytes
-arrive. Rather than staging the upload to learn its size, seal it with
-`SealStream`, which needs no size, and re-seal it padded in a background pass:
+All three write the same format. When `dst` is not an `io.WriterAt` and the
+size is unknown, seal plain now and pad later:
 
 ```go
-n, err := scheme.SealStreamAAD(masterKey, dst, part, aad)   // request path
-r, err := scheme.OpenReaderAAD(masterKey, src, aad)         // background pass
-// n comes from stage 1 here, or back out of the sealed size
+_, err := scheme.SealStreamAAD(masterKey, dst, part, aad) // request path
+
+n, ok := envelope.PlaintextLen(sealedSize, chunkSize)    // later
+r, err := scheme.OpenReaderAAD(masterKey, src, aad)
 _, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
 ```
 
-The length need not be recorded anywhere: an unpadded stream is
-`streamHeaderSize + n + TagSize * ceil(n/chunkSize)` bytes, and that inverts
-exactly, so the very leak that padding exists to remove is what tells the padder
-how much to pad. A crash leaves a valid sealed object instead of a lost upload,
-and no plaintext touches disk in either stage.
+## Errors
 
-What the second pass costs is a window in which the object sits unpadded, one
-extra read and write per object, and a note of which objects are still owed
-one. That last part is not free, because the two formats are domain-separated
-(see [below](#reading-it-back)): an unpadded object opened as padded fails with
-`ErrStreamAuth`, the same as a wrong key. Retry with `OpenStream` to identify
-it, or record the state wherever you record the object.
-See [`_example/envelope`](../_example/envelope/main.go) section 11.
-
-**A wrong `size` is cheap, so it may come from an untrusted peer.** The
-mismatch is caught at the payload boundary, before any padding is generated, so
-`dst` receives one chunk at most, however large the declared size was. Checking
-only the sealed total at the end would be just as correct and quite ruinous: a
-caller declaring 1 TiB and then sending one byte would have ~16 GiB of zeros
-written before the mismatch surfaced, one byte in and gigabytes out, with the
-peer choosing the multiplier. As it is, that same call costs the 37-byte header
-and nothing else. An endpoint can therefore take a length from its client
-without handing over that lever, though bounding it against your own limit is
-still worth doing.
-
-#### Bucket policy
-
-`PaddedSize(n)` returns `padme(9 + n)`, the Padmé rule from
-[Reducing Metadata Leakage from Encrypted Files](https://petsymposium.org/popets/2019/popets-2019-0056.php)
-(PoPETs 2019). It keeps only the top `log2(log2(L))` bits of the length
-significant, which caps the overhead near 12%, leaves it around 3% on average,
-and collapses every length inside one bucket onto a single size on disk.
-
-Measured with the default 1 MiB chunk size, the first three payloads share a
-bucket:
-
-| Payload | `PaddedSize` | Padded file | Unpadded file | Overhead |
-| --- | --- | --- | --- | --- |
-| 94,500 | 96,256 | **96,309** | 94,553 | 1.9% |
-| 96,037 | 96,256 | **96,309** | 96,090 | 0.3% |
-| 96,200 | 96,256 | **96,309** | 96,253 | 0.1% |
-| 100,000 | 100,352 | 100,405 | 100,053 | 0.4% |
-
-On-disk size is `streamHeaderSize + PaddedSize(n) + TagSize * chunks`, with
-`chunks = ceil(PaddedSize(n) / chunkSize)`. The bucket width grows with the
-length: 2 KiB near 96 KB, 32 KiB near 1 MB, 16 MiB near 1 GB. That defeats
-identifying a known document by its byte count and blurs save-over-save edit
-tracking; it is not enough to make a 90 KB file indistinguishable from a 97 KB
-one. For that, pad every file in a class to one fixed size and pay for it.
-
-#### Reading it back
-
-`OpenPaddedStream` (and `OpenPaddedFile`, which wraps it) reads the frame,
-writes out exactly `realLen` bytes, and then **drains the rest of the
-stream**. That last step is not optional: the padding
-occupies whole trailing chunks, and only reading to the end authenticates them
-and the final-chunk flag. Stopping at the payload would silently accept a
-stream truncated inside its padding.
-
-The drain is **bounded**: the expected padding is computed from `PaddedSize`
-before reading, so a frame declaring a small payload inside a huge stream is
-rejected after a couple of chunks rather than after the whole file. The stream
-must then end exactly there. That comparison is not needed to recover the
-payload, but it pins the format: a sealer using a different bucket rule, or a
-`padme` quietly changed without bumping `paddingVersion`, produces blobs that
-stop opening rather than blobs that open as something else.
-
-Treat `dst` as provisional until the call returns `nil`: the payload reaches it
-before the trailing padding chunks are authenticated, so a stream truncated
-inside its padding leaves a complete payload next to a non-nil error.
-`OpenPaddedFile` removes the partial destination for you, which is the reason
-to prefer it when the destination is a file.
-
-**The payload can be pulled instead of pushed.** `OpenPaddedReader` (and
-`OpenPaddedReaderAAD`) returns a `PaddedReader`: an `io.ReadCloser` over the
-payload alone, whose `Size` reports the payload length from the authenticated
-frame before a byte of body is handed out. That is what an HTTP handler needs to
-set `Content-Length` without recording the plaintext length beside the blob, and
-what anything consuming an `io.Reader` needs. `OpenPaddedStream` is that reader
-driven to its end, so there is one implementation of the frame and the drain.
-
-It is the one reader here whose payload ends before its stream does, which is
-what `Close` is for. `Read` and `WriteTo` report the end of the payload only
-once the padding behind it has authenticated, so reading to `io.EOF` needs
-nothing further. A caller that asks for exactly `Size` bytes stops one call
-short of that check, and `Close` is where it then happens: `nil` means the
-payload was complete and the padding behind it intact. Closing with payload
-still unread reports `ErrIncompleteRead` instead of draining however much was
-skipped to reach the tail, since this package does not read an unbounded amount
-behind the caller's back; a reader being abandoned holds nothing, so it can just
-be dropped.
-
-**The two formats are domain-separated by AAD.** Every stream authenticates a
-format tag, `pilinux/crypt/envelope:stream:v1` for a plain one and
-`pilinux/crypt/envelope:padded:v1` for a padded one. The tag is never stored,
-so a padded file and a plain one are byte-identical in shape and the header
-still does not announce which is which, yet neither reader can be fooled into
-accepting the other's stream. Without it, detection would rest on a version
-byte plus a length that ordinary framed data could imitate, and a false accept
-would mean silently truncating a payload.
-
-Two details make the separation hold rather than merely look like it holds.
-The tag travels as an argument of the internal sealer, not inside the caller's
-AAD: format identity and record identity are different things, and sharing one
-channel would let a caller of either format spell out the other's marker.
-And the tag and the AAD are bound into one **fixed-width** 32-byte value,
-`SHA-256(len(tag) || tag || aad)`, appended to the header:
-
-```text
-additional data = header(37) || SHA-256(len(tag) || tag || aad)   [32 bytes]
-```
-
-A concatenation would not do. The caller owns `aad` and therefore owns its
-leading bytes, so any prefix one format prepends is a prefix the other
-format's caller can type out, and the two would present identical additional
-data to the AEAD. Collapsing the pair to a digest means imitating another
-format's binding requires a SHA-256 collision, and writing the tag length in
-first means a tag and an AAD can never trade bytes across their own boundary.
-
-The price is diagnosis: a plain stream opened as padded fails with
-`ErrStreamAuth`, the same as a wrong key. To tell those apart, retry with
-`OpenStream` over a fresh reader, which succeeds only in the unpadded case. It
-also shifts what `ErrNoPaddingFrame` means: no longer "sealed before padding
-existed", but "padded in a format newer than this reader". The tag carries its
-own version, frozen like the HKDF labels; `paddingVersion` stays inside the
-authenticated plaintext, which is where a future opener will dispatch on it.
-
-| Situation | Error |
+| Error | Returned when |
 | --- | --- |
-| stream sealed without padding, or with a different AAD or key | `ErrStreamAuth`, before any frame is read |
-| authenticated as padded but carrying no frame, i.e. a newer padded format | `ErrNoPaddingFrame` (wraps `ErrNotPadded`) |
-| a frame was read and the stream then contradicted it: too little payload, or a padding length `PaddedSize` would not have produced | `ErrPaddingMalformed` (wraps `ErrNotPadded`) |
-| source is not a regular file, changed size while being sealed, or did not deliver the declared `size` (caught at the payload boundary, before any padding is written) | `ErrSourceIrregular`, `ErrSourceShort` or `ErrSourceLong`, all matching `ErrSourceSize` |
-| padding chunks removed, reordered or altered | `ErrStreamAuth`, thanks to the drain |
-| a `PaddedReader` closed before its payload had been read | `ErrIncompleteRead`, which says only that the padding was never checked |
+| `ErrSecretTooShort` | secret under 32 bytes |
+| `ErrInvalidKeySize` | a key argument is not 32 bytes, or an unwrapped key is not |
+| `ErrInvalidSaltSize` | a salt argument is not 16 bytes |
+| `ErrBadEnvelope` | malformed envelope or base64 |
+| `ErrEnvelopeAuth` | envelope or wrapped key fails authentication: wrong key, wrong AAD, altered byte |
+| `ErrNotAnInteger` | authentic token that is not an 8-byte `int64` |
+| `ErrInvalidChunkSize` | chunk size out of range, above `MaxAcceptedChunkSize`, or a `ChunkSize` above it at seal time |
+| `ErrBadStream` | bad stream header, or a chunk too short to hold a tag |
+| `ErrStreamAuth` | a chunk fails authentication, including a plain stream opened as padded |
+| `ErrStreamClosed` | `Write` after `Close` |
+| `ErrStreamAborted` | any call after `Abort`, unless the stream had already ended or failed: that verdict stands |
+| `ErrNotPadded` | umbrella for the next two |
+| `ErrNoPaddingFrame` | authentic padded stream without a frame: a newer padded format |
+| `ErrPaddingMalformed` | the stream contradicts its frame: short payload, wrong padding length, non-zero padding |
+| `ErrSourceSize` | umbrella for the next three; returned bare for a negative or unrepresentable size |
+| `ErrSourceIrregular` | `SealPaddedFile` source is not a regular file |
+| `ErrSourceShort` / `ErrSourceLong` | source delivered less or more than the declared size |
+| `ErrIncompleteRead` | `PaddedReader.Close` with payload still unread |
 
-Padding hides the length and nothing else. The file name, the directory, the
-mtime and the access pattern all leak independently, and a name like
-`salary.xlsx.enc` gives away more than the size ever did. Give sealed files
-opaque names (`RandomHex`) and keep the mapping in a sealed column.
+Authentication errors never say which of wrong key, wrong AAD or altered bytes
+it was.
 
-### 5. The two formats side by side
+## Rules worth knowing
 
-| | Single-shot envelope | Stream |
-| --- | --- | --- |
-| version byte | `0x01` | `0x81` |
-| header | 18 bytes (version, saltLen, salt) | 37 bytes (+ chunkSize, noncePrefix) |
-| salt | one per **item** | one per **stream** |
-| sub-key | one per **item** | one per **stream**, shared by all chunks |
-| nonce | 24 random bytes, stored in the blob | derived per chunk: 15-byte stored prefix + counter + flag |
-| tags | 1 | one per chunk |
-| AEAD additional data | `header(18) \|\| callerAAD` (`authData`) | `header(37) \|\| SHA-256(len(tag) \|\| tag \|\| callerAAD)` (`streamAuthData`), identical for every chunk |
-| overhead | 58 bytes | `37 + 16 * chunks` |
-| memory | whole item | one chunk |
-| output | `[]byte`, or base64 for the string/int64 helpers | raw bytes to an `io.Writer` (no base64) |
-| entry points | `SealBytes`, `SealString`, `SealInt64` | `SealWriter`, `SealStream`, `SealFile` |
+- **Labels are frozen, `ChunkSize` is not.** Every stream records its own chunk size.
+- **Output is provisional until the call returns `nil`.** Chunks reach `dst` as
+  they authenticate. `SealFile`/`OpenFile` and the padded file forms remove a
+  partial destination; with a stream, discard `dst` yourself.
+- **Only `Close` completes a stream, and only if nothing failed.** A source
+  error that the writer reads itself, including `io.ErrUnexpectedEOF` from a
+  cut-off body, is sticky, so `Close` returns it and writes no final chunk.
+  That covers `SealStream`, `SealFile` and `io.Copy` from a source without a
+  `WriteTo` method. A source that has one, a `StreamReader` for instance,
+  makes `io.Copy` call it instead, and its failure never reaches the writer:
+  check `io.Copy`'s error and let `Abort` discard the stream, or `Close` seals
+  what arrived as a valid short stream. `Abort` discards a stream on purpose.
+- **Read a `PaddedReader` to `io.EOF`, or call `Close`.** The padding behind
+  the payload is only checked there.
+- **A wrong `size` never costs padding.** `SealPaddedStream` fails at the
+  payload boundary, before any padding is written, so `dst` gets no more than
+  `src` actually delivered and `size` may come from a client.
+  Detecting extra data consumes one byte of `src`; wrap a framed source in
+  `io.LimitReader`.
+- **`SealPaddedAt` needs an empty `dst`.** Old bytes past the new end would
+  break the stream.
+- **Padded and plain streams look identical.** Opening a plain one as padded
+  is `ErrStreamAuth`; retry with `OpenStream` over a fresh reader to tell it
+  from a wrong key.
+- **A reader allocates the chunk size in the header before anything
+  authenticates.** Set `Config.MaxAcceptedChunkSize` to the largest chunk you
+  write so a stranger cannot cost you 64 MiB per open.
+- **`padme` and the format tags are frozen like the labels.** Changing `padme`
+  breaks every padded stream; changing a tag breaks every stream of its format.
 
-### 6. What an observer of the ciphertext learns
+## What the ciphertext reveals
 
 | Visible | Hidden |
 | --- | --- |
-| that it is a `crypt/envelope` blob, and which of the two formats | the plaintext, the master key, the KEK, the secret, the labels |
-| the exact plaintext length (single-shot: `blob - 58`; stream: `sealed - 37 - 16 × chunks`), unless the payload was padded | the magnitude of a sealed int64, and the length of a padded payload to within its Padmé bucket |
-| the chunk size of a stream | the caller AAD content, which is never stored (only whether *your* guess of it verifies) |
-| the salt, nonce and nonce prefix, none of which are secret | whether two blobs hold the same plaintext: fresh salt and nonce per item make that unlinkable |
-| the number of chunks a stream was cut into | which master key sealed it: nothing in the blob identifies the key |
+| which format, and a stream's chunk size and chunk count | plaintext, keys, secret, labels, AAD |
+| exact plaintext length: `blob - 58`, or `sealed - 37 - 16 * chunks` | an `int64`'s magnitude; a padded payload's length within its bucket |
+| salt, nonce, nonce prefix (not secret) | whether two blobs hold the same plaintext |
+| | which master key sealed it |
 
-If plaintext length matters for your data, seal it with
-[`SealPaddedFile` or `SealPaddedStream`](#4-padded-payloads-length-hiding).
-Single-shot tokens are not padded (`SealInt64` is the one fixed-width case), so
-pad those yourself before sealing.
+Padding hides the length only. Names, timestamps and access patterns still leak;
+`RandomHex` makes an opaque file name.
 
----
+## Source files
 
-## envelope.go
+| File | Contents |
+| --- | --- |
+| `envelope.go` | constants, errors, `Config`, `Scheme`, `New`/`Default`, envelope header codec |
+| `keys.go` | `DeriveKEK`, `GenerateMasterKey`, `WrapKey`/`UnwrapKey`, `Zero` |
+| `cipher.go` | `DeriveSubKey`, `GenerateSalt`, `Seal`/`Open` for bytes, string and `int64` |
+| `stream.go` | stream format, `StreamWriter`, `StreamReader`, `SealStream`/`OpenStream`, `PlaintextLen` |
+| `file.go` | `SealFile`/`OpenFile` over `pipeFile` (`O_EXCL`, mode `0600`, removed on error) |
+| `padding.go` | `PaddedSize`, padded sealers, `PaddedReader`, padded openers |
+| `exactreader.go` | `exactReader` (delivers exactly `size` bytes or fails) and `zeroReader` |
+| `hash.go` | `Sha256Hex`, `RandomHex` |
 
-Package doc, shared constants/errors, `Scheme` construction, header codec.
-
-### Constants
-
-- `KeySize` = 32: KEK, master key and sub-key length (XChaCha20 requires 256-bit).
-- `SaltSize` = 16: per-item HKDF salt.
-- `NonceSize` = 24: XChaCha20-Poly1305 nonce.
-- `TagSize` = 16: Poly1305 tag.
-- `MinSecretLength` = 32: floor for the app secret. No password stretching, so the secret must be machine-generated.
-- `DefaultKEKLabel`, `DefaultSubKeyLabel`: fallback HKDF info labels. Frozen per app, since changing them re-derives different keys and orphans already-sealed data.
-- `envelopeVersion` = `0x01`, `envelopeHeaderSize` = 2 (unexported): format tag, plus the version/saltLen byte pair.
-
-### Errors
-
-- `ErrSecretTooShort`: secret shorter than `MinSecretLength`.
-- `ErrInvalidKeySize`: key argument is not 32 bytes.
-- `ErrInvalidSaltSize`: salt argument is not 16 bytes.
-- `ErrBadEnvelope`: blob is not a well-formed envelope (bad version, a salt length other than 16, bad total length, bad base64).
-- `ErrNotAnInteger`: token authenticates but its plaintext is not the 8-byte int64 encoding.
-- `ErrEnvelopeAuth`: a well-formed envelope failed authentication, i.e. a wrong master key, a wrong or missing AAD, or an altered byte. The single-shot counterpart of `ErrStreamAuth`, and returned by `UnwrapKey` too, which is what makes the documented rotation check expressible.
-
-All generic on purpose, so an HTTP layer can return them without leaking detail.
-`ErrEnvelopeAuth` in particular says only that authentication failed, never
-which of the three reasons it was.
-
-### Types
-
-- `Config`: `KEKLabel`, `SubKeyLabel`, `ChunkSize`, `MaxAcceptedChunkSize`. Empty label falls back to the package default; `ChunkSize` 0 falls back to `DefaultChunkSize`; `MaxAcceptedChunkSize` 0 falls back to `MaxChunkSize`.
-- `Scheme`: holds the two labels, the chunk size and the reader ceiling. Immutable and concurrency-safe; label-dependent operations are methods on it.
-
-### Functions
-
-- `New(cfg Config) *Scheme`: build a `Scheme`, filling empty fields with defaults.
-- `Default() *Scheme`: `New(Config{})`, the zero-config path.
-- `randomBytes(n)`: n bytes from `crypto/rand`, the one randomness source in the package.
-- `buildHeader(salt)`: `version || saltLen || salt`. Rejects a salt outside 1..255 so the length byte cannot overflow.
-- `authData(header, aad)`: `header || aad`, the AEAD additional data of the **single-shot** format. A nil or empty aad authenticates the header alone, with no copy made. Unambiguous because the header states its own length in `saltLen`; the streaming format cannot rely on that and uses `streamAuthData` instead.
-- `unpackEnvelope(blob)`: split into header, salt and ciphertext (all aliasing `blob`). Rejects a wrong version byte, any salt length other than `SaltSize`, or a blob too short to hold nonce plus tag, all as `ErrBadEnvelope`.
-
-## keys.go
-
-The outer layer: secret to KEK to wrapped master key.
-
-- `(*Scheme) DeriveKEK(secret string)`: HKDF-SHA256 (nil salt, KEK label) to a 32-byte KEK. Rejects a secret under 32 bytes. Deterministic, so a rotated secret shows up as an unwrap failure. Wipe with `Zero` after use.
-- `GenerateMasterKey()`: 32 random bytes (DEK). Called once, ever.
-- `WrapKey(kek, masterKey)`: `crypt.EncryptByteXChacha20poly1305WithNonceAppended(kek, masterKey)`, both args length-checked. This is what gets stored at rest.
-- `UnwrapKey(kek, wrapped)`: the reverse. A non-nil error means a wrong KEK (secret changed), tampering, or an authentic plaintext that is not 32 bytes, which is wiped before returning `ErrInvalidKeySize`.
-- `Zero(b)`: `clear(b)`, to wipe key material. Best effort. Sub-keys are wiped internally; the KEK and master key are the caller's to wipe.
-
-## cipher.go
-
-Single-shot Seal/Open, holding the whole item in memory. Delegation is always plain → AAD → `SealBytesAAD`/`OpenBytesAAD`.
-
-- `int64WireSize` = 8 (unexported): fixed int64 plaintext width, so token length cannot leak the magnitude.
-- `GenerateSalt()`: 16 random bytes, one per item.
-- `(*Scheme) DeriveSubKey(masterKey, salt)`: HKDF-SHA256(masterKey, salt, sub-key label) to a 32-byte per-item key. The "smart salt" step: the master key is never an AEAD key, and each item gets its own key, so a nonce can never repeat under one key.
-
-### Bytes
-
-- `SealBytes(masterKey, plaintext)` → `SealBytesAAD(..., nil)`.
-- `SealBytesAAD(masterKey, plaintext, aad)`, the core: `GenerateSalt` → `DeriveSubKey` (wiped on return) → `buildHeader` → XChaCha20-Poly1305 with `authData(header, aad)` → `header || nonce || ciphertext || tag`.
-- `OpenBytes(masterKey, blob)` → `OpenBytesAAD(..., nil)`.
-- `OpenBytesAAD(masterKey, blob, aad)`, the core: `unpackEnvelope` → re-derive the sub-key from the stored salt (wiped on return) → decrypt with the same `authData`. A wrong key, a wrong or missing aad, or any altered byte is an authentication failure.
-
-### String
-
-- `SealString(masterKey, plaintext)` → `SealStringAAD(..., nil)`.
-- `SealStringAAD(masterKey, plaintext, aad)` → `SealBytesAAD` → std base64, so the token drops into JSON.
-- `OpenString(masterKey, token)` → `OpenStringAAD(..., nil)`.
-- `OpenStringAAD(masterKey, token, aad)`: base64 decode (bad base64 gives `ErrBadEnvelope`) → `OpenBytesAAD` → string.
-
-### Int64
-
-- `SealInt64(masterKey, n)` → `SealInt64AAD(..., nil)`.
-- `SealInt64AAD(masterKey, n, aad)`: 8-byte big-endian two's complement → `SealBytesAAD` → base64. Every int64 token is the same length.
-- `OpenInt64(masterKey, token)` → `OpenInt64AAD(..., nil)`.
-- `OpenInt64AAD(masterKey, token, aad)`: base64 decode → `OpenBytesAAD` → require exactly 8 bytes (otherwise `ErrNotAnInteger`, e.g. a token sealed by `SealString`) → int64.
-
-**AAD** (any variant): a record ID, field name, or simply nil; authenticated but neither encrypted nor stored. A different aad means tokens cannot be swapped between rows or fields. The identical bytes must be supplied at decryption.
-
-## stream.go
-
-Chunked STREAM construction for input that does not fit in memory. One sub-key per stream, one nonce per chunk. Nothing is allocated per chunk, which is why the buffers and look-ahead bytes are struct fields.
-
-### Constants and errors
-
-- `DefaultChunkSize` = 1 MiB, `MinChunkSize` = 1 KiB (keeps tag overhead under 2%), `MaxChunkSize` = 64 MiB (the widest chunk the format allows, and the default ceiling a reader will honour from a header).
-- `StreamHeaderSize` = 37: the cleartext header every stream begins with, exported so callers can do the format's size arithmetic without copying the constant.
-- `streamVersion` = `0x81`: high bit set so it can never collide with `envelopeVersion`, and each reader rejects the other's blob up front.
-- `streamNoncePrefixSize` = 15, `streamCounterSize` = 8, `streamChunkSizeWidth` = 4, `streamHeaderSize` = 37.
-- `ErrInvalidChunkSize`: chunk size outside `MinChunkSize`..`MaxChunkSize`, whether it came from `Config.ChunkSize`, from `Config.MaxAcceptedChunkSize`, or from a stream header that exceeds the ceiling this `Scheme` accepts; also a seal whose `Config.ChunkSize` exceeds that same ceiling, since the `Scheme` could never open what it wrote.
-- `ErrBadStream`: bad header, or a chunk too short to hold a tag.
-- `ErrStreamAuth`: chunk failed authentication. Wrong key or aad, modified data, or chunks reordered, duplicated, dropped or truncated.
-- `ErrStreamClosed`: `Write` after a clean `Close`. A writer that failed or was aborted reports what ended it instead.
-- `ErrStreamAborted`: `Close` or a write method after `StreamWriter.Abort` discarded the stream, or a read method after `StreamReader.Abort` ended it. It says the stream was abandoned on purpose (for a writer, the fragment on `dst`), not that anything went wrong with it.
-
-### Header and nonce helpers
-
-- `buildStreamHeader(salt, chunkSize, noncePrefix)`: assemble the 37-byte cleartext header, validating all three inputs.
-- `parseStreamHeader(header)`: validate and split it back into salt, chunk size and nonce prefix (aliasing `header`). The chunk size always comes from the stream, never from the `Scheme`, so changing `Config.ChunkSize` never orphans data. `openReader` then checks it against `Config.MaxAcceptedChunkSize` before allocating, since nothing is authenticated yet at that point.
-- `PlaintextLen(sealed, chunkSize)`: invert `StreamHeaderSize + n + TagSize*ceil(n/chunkSize)` to recover `n` from a sealed size, reporting false when no length produces that size. The answer is unique because the chunk count never falls as `n` grows, and the search is a couple of candidates whatever the size. It inverts the **unpadded** format; on a padded stream it returns the padded length, not the payload length the padding exists to hide.
-- `checkReadCeiling()`: validate `Config.MaxAcceptedChunkSize`, reported when a stream is created rather than at `New`, exactly as `ChunkSize` is. It does not compare the two: it runs on open too, where a `ChunkSize` above the ceiling is legitimate, so that check lives in `sealWriter`.
-- `streamNonce(dst, prefix, counter, final)`: `prefix(15) || counter(8 BE) || finalFlag(1)`. The counter pins a chunk to its position and the flag marks the last one, which is what makes reorder, duplicate, drop and truncate authentication failures.
-- `(*Scheme) streamAEAD(masterKey, salt)`: `DeriveSubKey` → one long-lived `chacha20poly1305.NewX` AEAD. The local sub-key copy is wiped immediately.
-
-### StreamWriter
-
-- `StreamWriter`: buffers one chunk (`buf`, cap `chunkSize+TagSize` so sealing happens in place) and holds the AEAD, the authenticated `aad`, the nonce prefix, the chunk counter, a `next[1]byte` look-ahead field and a sticky `err`.
-- `(*Scheme) SealWriter(masterKey, dst)` → `SealWriterAAD(..., nil)`.
-- `(*Scheme) SealWriterAAD(masterKey, dst, aad)`: once per stream, salt plus nonce prefix, `buildStreamHeader`, `streamAEAD`, `streamAuthData`, then write the header to `dst`. The ciphertext is only complete after `Close`. It is `sealWriter` under `plainStreamTag`; the padded sealer is the same call under `paddedStreamTag`.
-- `(*StreamWriter) Write(p)`: buffer `p`, sealing a full buffer as a non-final chunk when more data follows. The trailing chunk is always held back for `Close`.
-- `(*StreamWriter) ReadFrom(r)`: the `io.Copy` fast path. `io.ReadFull` straight into `buf`, then a one-byte look-ahead so a full buffer is only sealed as non-final if something actually follows.
-- `(*StreamWriter) Close()`: seals the remainder as the final chunk and wipes `buf`. Idempotent, and it does not close `dst`. It finalizes only a stream that has not failed: a chunk that could not be written, a source that quit part-way, or an `Abort` is sticky and `Close` returns that error without emitting a final chunk, so `defer w.Close()` cannot turn an interrupted transfer into a valid short stream.
-- `(*StreamWriter) state()`: sticky error first, then `ErrStreamClosed`.
-- `(*StreamWriter) seal(final)`: `streamNonce` → `aead.Seal(buf[:0], ...)` in place → `writeAll` → bump counter. A write failure is sticky, so a half-written stream can never be finalized.
-- `writeAll(dst, p)`: the destination-side guard both writes share, and the mirror of what `(*StreamReader) WriteTo` does. `dst` is caller-supplied, so a count outside `0..len(p)` is an invalid write count and a short write reported with a nil error is `io.ErrShortWrite`. Without it a destination that quietly drops bytes leaves `Close` reporting success for a stream whose ciphertext is incomplete, which is the verdict a caller acts on by discarding the plaintext.
-- `(*StreamWriter) Abort()`: discard the stream without finalizing it: mark closed, wipe `buf`, and record `ErrStreamAborted` so every later call reports it. For the case no sticky error can catch, where nothing went wrong and the caller simply decided not to keep the stream. A no-op once `Close` has succeeded, so `defer w.Abort()` alongside an explicit `w.Close()` is the safe shape.
-- `(*StreamWriter) fail(err)`: record the terminal state, first error wins.
-
-### StreamReader
-
-- `StreamReader`: the mirror image. One ciphertext chunk decrypted in place, `plain` aliasing the decrypted part not yet handed out, a `carry[1]byte` look-ahead field, counter, `final`, and a sticky `err` (`io.EOF` on a clean end).
-- `(*Scheme) OpenReader(masterKey, src)` → `OpenReaderAAD(..., nil)`.
-- `(*Scheme) OpenReaderAAD(masterKey, src, aad)`: read and validate the header up front (short input gives `ErrBadStream`), rebuild the same AEAD and `streamAuthData`, and size `buf` from the header's chunk size. It is `openReader` under `plainStreamTag`. Nothing is authenticated yet at this point: the header carries no tag of its own, so a wrong key or AAD is only reported once the first chunk is read.
-- `(*StreamReader) Read(p)`: serve from `plain`, decrypting the next chunk when it runs out. A stream that ends without an authentic final chunk fails with `ErrStreamAuth`, not a clean EOF.
-- `(*StreamReader) WriteTo(dst)`: the `io.Copy` fast path, draining a whole chunk at a time. `dst` is caller-supplied, so its reported count is checked the way `io.Copy` checks it: a count outside `0..len(p)` ends the reader, and a short write with no error is `io.ErrShortWrite` rather than another trip round the loop.
-- `(*StreamReader) readChunk()`: carry byte plus `io.ReadFull` → one-byte look-ahead decides `final` → `streamNonce` → `aead.Open(buf[:0], ...)` in place. Any failure is `ErrStreamAuth`.
-- `(*StreamReader) Abort()`: end the reader early, for a caller that stops before the end: `fail(ErrStreamAborted)`, which wipes `buf` so up to a chunk of decrypted plaintext does not stay on the heap until the reader is collected. It does not touch `src`, and a reader that already reported `io.EOF` or an error keeps that verdict, so `defer r.Abort()` is safe. Not named `Close`, so the type does not become an `io.ReadCloser` that plumbing might close `src` through.
-- `(*StreamReader) fail(err)`: record the terminal state (`io.EOF` means clean) and wipe the buffer. First error wins, as in the writer; the wipe runs on every call.
-
-### One-shot stream helpers
-
-- `(*Scheme) SealStream(masterKey, dst, src)` → `SealStreamAAD(..., nil)`.
-- `(*Scheme) SealStreamAAD(masterKey, dst, src, aad)`: `SealWriterAAD` → `ReadFrom` → `Close`, returning the plaintext bytes sealed. On error it calls `Abort()`, never `Close`, so a partial `dst` cannot pass as complete.
-- `(*Scheme) OpenStream(masterKey, dst, src)` → `OpenStreamAAD(..., nil)`.
-- `(*Scheme) OpenStreamAAD(masterKey, dst, src, aad)`: `OpenReaderAAD` → `WriteTo`, returning the plaintext bytes written. Chunks are written as they authenticate, so treat `dst` as unusable unless the call returns nil.
-
-Wire cost: `37 + n + 16*ceil(n/chunkSize)` bytes. Memory: one chunk, whatever the input size.
-
-## file.go
-
-File-to-file wrappers over the streaming API.
-
-- `filePerm` = `0o600`: mode of every file these create.
-- `(*Scheme) SealFile(masterKey, dstPath, srcPath)` → `SealFileAAD(..., nil)`.
-- `(*Scheme) SealFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` plus `SealStreamAAD`. Size is limited by the filesystem, not memory. A file name makes a natural aad.
-- `(*Scheme) OpenFile(masterKey, dstPath, srcPath)` → `OpenFileAAD(..., nil)`.
-- `(*Scheme) OpenFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` plus `OpenStreamAAD`. Corruption surfaces part-way through, and the partial output is removed first.
-- `pipeFile(dstPath, srcPath, fn)`: open src, create dst with `O_EXCL|0600` (so swapped arguments cannot truncate the source), run `fn`, `Sync`, `Close`, and `os.Remove(dstPath)` on any error. `fn` receives the open `*os.File`, not a plain reader, so `SealPaddedFileAAD` can `Stat` the handle it is about to read.
-
-## padding.go
-
-Length hiding for the streaming API: framing plus tail padding, so the file
-size no longer states the exact payload length. See
-[the wire format](#4-padded-payloads-length-hiding) for the layout and the
-numbers.
-
-- `paddingVersion` = `0x01`, `paddingFrameSize` = 9 (unexported): the frame
-  sealed ahead of the payload, `version(1) || realLen(8 BE)`.
-- `ErrNotPadded`: the umbrella for a stream that authenticates as padded and
-  then cannot be read as one. Match it to catch the class, the two sentinels
-  under it to tell which case. An ordinary `SealFile` stream never gets this
-  far: the format tag in the additional data stops it at `ErrStreamAuth`.
-- `ErrNoPaddingFrame`: authenticated, but the plaintext carries no frame, so
-  the padded format is newer than this reader.
-- `ErrPaddingMalformed`: a frame was read and the stream then contradicted it,
-  with too little payload or with a padding length `PaddedSize` would never
-  have produced.
-- `ErrSourceSize`: the umbrella for a source that could not supply the byte
-  count the padding was computed for. Padding is fixed before the first chunk
-  is sealed, so a source that moves underneath the sealer cannot produce a
-  well-formed padded stream.
-- `ErrSourceIrregular`: a `SealPaddedFile` source is not a regular file, so it
-  has no size to pad against.
-- `ErrSourceShort` / `ErrSourceLong`: which way a source missed its declared
-  size. Both wrap `ErrSourceSize`, so `errors.Is` against that still matches
-  either, while a caller that must tell "retry the upload" from "reject it" can
-  branch on the specific one.
-- `ErrIncompleteRead`: a `PaddedReader` was closed with payload still unread,
-  so the padding was never drained. It says what did not happen rather than what
-  is wrong, so it sits under neither umbrella: the bytes already read are as
-  authentic as the chunks that carried them.
-- `PaddedSize(n)`: the padded plaintext length for an n-byte payload, `padme(9 + n)`.
-  Exported so callers can budget storage; returns 0 for a negative or
-  unrepresentable n.
-- `padme(l)`: rounds l up so only its top `log2(log2(l))` bits are significant.
-  Overhead capped near 12%, about 3% on average. An overflow near `MaxInt64`
-  leaves the length unpadded rather than wrapping.
-`zeroReader` and `exactReader` live in **`exactreader.go`**, since neither
-knows anything about padding: they turn a caller's reader and a declared length
-into a source that delivers exactly that many bytes or says which way it missed.
-
-- `zeroReader`: an endless run of zeros. The padding is XORed with the
-  keystream like real data, so zeros are indistinguishable once sealed.
-- `exactReader`: yields exactly `size` bytes from `src`, then EOF, failing with
-  `ErrSourceSize` the moment `src` runs short or long. It bounds what a wrong
-  or hostile size can cost: the mismatch is caught before any padding is
-  generated, so `dst` receives at most one chunk instead of the whole Padmé
-  bucket. `src` is whatever the caller passed, so the reader is deliberately
-  suspicious of it:
-  - it never reads `src` again once `src` has reported `io.EOF`, since a
-    drained reader may close itself and answer `os.ErrClosed`, which would fail
-    a payload that was in fact complete;
-  - its errors are sticky, like `StreamWriter` and `StreamReader`, so a retry
-    after a failure cannot get a different answer;
-  - a zero-length read is answered `(0, nil)` without touching `src`, the one
-    case the `io.Reader` contract calls out for that return;
-  - a read count outside `0..len(p)`, or a negative remainder, would drive the
-    slice expression out of range, so both are refused rather than risked
-    (`bufio` panics here; this package fails closed);
-  - a legal `(0, nil)` read is retried instead of taken for EOF, which would
-    silently truncate the source. The retry gives up after
-    `maxConsecutiveEmptyReads` (100) with `io.ErrNoProgress`, on **both** the
-    end-of-payload probe and the fill. Bounding only the probe would not stop a
-    source that answers that way forever, it would move the spin into the
-    caller's `io.ReadFull`.
-
-  Both the bound and the error are the ones `bufio` uses for the same
-  situation.
-
-  **Detecting trailing data costs one byte of `src`**, and that is part of the
-  contract rather than a bug: it cannot be pushed back through a plain
-  `io.Reader`, and buffering it internally would not help, since the read still
-  drains `src` and the buffer dies with the reader. `ErrSourceLong` says so in
-  its own message, so the cost is visible at the failure and not only here. A
-  caller sealing one frame out of a longer stream should pass
-  `io.LimitReader(src, size)`, which reports EOF at exactly the right point and
-  is never probed past it.
-
-  The trailing check only runs if something drives the reader to its end, so
-  `SealPaddedStreamAAD` **verifies that it did** (`reachedEnd`) instead of
-  inheriting the guarantee from the caller's read pattern: `io.MultiReader`
-  drains the payload because it advances to the padding only on `io.EOF`, but
-  that is `io.MultiReader`'s property, not this reader's.
-- `(*Scheme) SealPaddedStream(masterKey, dst, src, size)` → `SealPaddedStreamAAD(..., nil)`.
-- `(*Scheme) SealPaddedStreamAAD(masterKey, dst, src, size, aad)`: the padded
-  primitive. `io.MultiReader(frame, exactReader{src}, zeros)` → `SealStreamAAD`,
-  with the sealed total checked against `PaddedSize` as a backstop, so a source
-  that declared or changed its size fails (`ErrSourceSize`) instead of writing a
-  frame that lies about the payload. Returns the real payload length, not the
-  padded one. Nothing beyond one chunk is buffered, so an in-memory blob, an
-  HTTP body or a pipe is padded and sealed on the fly.
-- `(*Scheme) SealPaddedAt(masterKey, dst, src)` → `SealPaddedAtAAD(..., nil)`.
-- `(*Scheme) SealPaddedAtAAD(masterKey, dst, src, aad)`: the sizeless form into an
-  `io.WriterAt`. `sealWriter` with its counter at 1 and an `io.OffsetWriter`
-  seeked past chunk 0 takes the rest of the payload and the zeros; chunk 0's
-  plaintext is held, framed once `n` is known, sealed exactly once with counter 0
-  and written at offset 37 through `writeAll`. Two chunks of memory.
-- `PaddedReader`: the pull form, an `io.ReadCloser` plus `io.WriterTo` over the
-  payload. Holds the `StreamReader`, the framed `size`, the payload `left`, the
-  `pad` still to drain and a sticky `err` (`io.EOF` on a clean end). No buffers
-  of its own.
-- `(*Scheme) OpenPaddedReader(masterKey, src)` → `OpenPaddedReaderAAD(..., nil)`.
-- `(*Scheme) OpenPaddedReaderAAD(masterKey, src, aad)`: `OpenReaderAAD` with the
-  padded AAD → read and check the frame up front, so a stream that is not a
-  readable padded one is reported before any payload byte is handed out.
-- `(*PaddedReader) Size()`: the framed payload length, authenticated with the
-  first chunk and known before the body. A truncated body still fails later.
-- `(*PaddedReader) Read(p)` / `WriteTo(dst)`: payload only, reporting the end
-  of the stream only once the padding behind it has drained and authenticated.
-  A zero-length read is answered `(0, nil)` without ending the reader, as in
-  `exactReader`.
-- `(*PaddedReader) Close()`: the verdict for a caller that stopped after `Size`
-  bytes, which is one call short of the padding check. `ErrIncompleteRead` if
-  payload is still unread; it never closes the source and repeats itself.
-- `(*PaddedReader) finish()` / `fail(err)`: the bounded drain plus end probe,
-  and the sticky terminal state, which also ends the `StreamReader` underneath
-  so the chunk it holds is wiped. The drain **verifies** the padding rather than
-  discarding it: it reads through a 512-byte buffer and any non-zero byte is
-  `ErrPaddingMalformed`. Only a key holder can build such a stream, so this is
-  not about forgery; it is that padding no reader ever looked at is space
-  something could have been hidden in, inside a format whose whole point is to
-  give nothing away.
-- `(*Scheme) OpenPaddedStream(masterKey, dst, src)` → `OpenPaddedStreamAAD(..., nil)`.
-- `(*Scheme) OpenPaddedStreamAAD(masterKey, dst, src, aad)`:
-  `OpenPaddedReaderAAD` → `WriteTo`, the same shape `OpenStreamAAD` has over
-  `OpenReaderAAD`. The drain inside authenticates the padding-only trailing
-  chunks and the final-chunk flag; without it a stream truncated inside its
-  padding would pass.
-- `(*Scheme) SealPaddedFile(masterKey, dstPath, srcPath)` → `SealPaddedFileAAD(..., nil)`.
-- `(*Scheme) SealPaddedFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` →
-  `Stat` the open handle → `SealPaddedStreamAAD`.
-- `(*Scheme) OpenPaddedFile(masterKey, dstPath, srcPath)` → `OpenPaddedFileAAD(..., nil)`.
-- `(*Scheme) OpenPaddedFileAAD(masterKey, dstPath, srcPath, aad)`: `pipeFile` plus
-  `OpenPaddedStreamAAD`.
-
-## hash.go
-
-Small helpers, unrelated to key derivation.
-
-- `Sha256Hex(data)`: lowercase hex SHA-256. Fingerprint a plaintext before encrypting to verify a later decryption end to end.
-- `RandomHex(n)`: n random bytes hex-encoded (2n chars). Unpredictable IDs that double as safe filenames.
-
-## Test files
-
-`go test -race -cover ./...`. Streaming tests use `MinChunkSize` chunks so multi-chunk cases stay cheap.
-
-- `envelope_test.go`: `randomBytes`, header build/unpack round-trip and rejections, label plumbing in `New`/`Default`.
-- `keys_test.go`: KEK derivation (determinism, short secret, label separation), master key generation, wrap/unwrap failures, `Zero`.
-- `cipher_test.go`: salt generation, sub-key derivation, Seal/Open round-trips and tamper cases for bytes, string and int64, AAD mismatch.
-- `stream_test.go`: round-trips and sizes (`sealedSize`), AAD, wrong key, integrity (reorder, duplicate, drop, truncate, bit flip), envelope/stream separation, chunk-size handling, sticky errors both ways, header codec, nonce layout, and `TestStreamAllocationsPerChunk` (1-chunk versus 100-chunk allocations, guarding the no-per-chunk-allocation property).
-- `file_test.go`: file round-trip with and without AAD, refusal to overwrite an existing destination, missing source, partial output removed on corruption.
-- `padding_test.go`, in four groups: the bucket rule (`PaddedSize` values, monotonicity, the 12% overhead cap); round-trips across the chunk boundary cases, in a file and in memory, with and without AAD, plus the length-hiding property (three payload sizes, one file size) and stream/file interop; the rejections (unpadded and malformed frames, an irregular source, a size mismatch either way with the write to `dst` capped at one chunk, padding-only truncation caught by the drain, and the drain itself bounded against an oversized stream); and one test per `exactReader` guard, since each guard exists for a source that misbehaves in exactly one way: legal empty reads, a stall on `(0, nil)` forever, a reader that closes itself at EOF, sticky errors and sticky EOF, zero-length reads, an invalid read count, and the short-versus-long messages.
-- `hash_test.go`: `Sha256Hex` against known digests, `RandomHex` length and uniqueness.
+Tests: `go test -race -cover ./...`. Stream tests use 1 KiB chunks so
+multi-chunk cases stay cheap. The runnable walkthrough is
+[`_example/envelope`](../_example/envelope/main.go).

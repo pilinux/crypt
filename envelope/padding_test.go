@@ -2153,9 +2153,9 @@ func TestPaddingContentIsVerified(t *testing.T) {
 }
 
 // TestPaddedStreamTruncationIsAuthFailure pins the behaviour two doc comments
-// used to describe wrongly. Truncation is caught by the chunk chain, so it is
-// ErrStreamAuth; ErrPaddingMalformed is for a stream that authenticates whole
-// and still contradicts its own frame.
+// used to describe wrongly. A cut that leaves at least a tag of the last chunk
+// is caught by the chunk chain, so it is ErrStreamAuth; ErrPaddingMalformed is
+// for a stream that authenticates whole and still contradicts its own frame.
 func TestPaddedStreamTruncationIsAuthFailure(t *testing.T) {
 	s := streamScheme()
 	masterKey := newMasterKey(t)
@@ -2172,6 +2172,32 @@ func TestPaddedStreamTruncationIsAuthFailure(t *testing.T) {
 		}
 		if errors.Is(err, ErrNotPadded) {
 			t.Errorf("cut %d bytes: truncation must not report the padded-format umbrella", cut)
+		}
+	}
+}
+
+// TestPaddedStreamShortFragmentIsBadStream covers the other truncation case: a
+// cut that leaves less than a tag of a chunk, or no chunk at all. It is
+// rejected before decryption, so it is ErrBadStream, and never a padding error.
+func TestPaddedStreamShortFragmentIsBadStream(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	blob := sealPaddedBlob(t, s, masterKey, randomData(t, paddedTestSize))
+	last := len(blob)/(testChunkSize+TagSize) - 1 // a chunk holding only padding
+
+	cuts := map[string]int{
+		"header only":           chunkOffset(0),
+		"1 byte of chunk 1":     chunkOffset(1) + 1,
+		"15 bytes of chunk 1":   chunkOffset(1) + TagSize - 1,
+		"15 bytes into padding": chunkOffset(last) + TagSize - 1,
+	}
+	for name, cut := range cuts {
+		_, err := s.OpenPaddedStream(masterKey, io.Discard, bytes.NewReader(blob[:cut]))
+		if !errors.Is(err, ErrBadStream) {
+			t.Errorf("%s: err = %v, want ErrBadStream", name, err)
+		}
+		if errors.Is(err, ErrNotPadded) {
+			t.Errorf("%s: truncation must not report the padded-format umbrella", name)
 		}
 	}
 }

@@ -372,12 +372,15 @@ func (s *Scheme) SealWriter(masterKey []byte, dst io.Writer) (*StreamWriter, err
 // The stream header is written to dst immediately; the ciphertext is only
 // complete once [StreamWriter.Close] has returned without error.
 //
-// Close finalizes what has been written, so it completes a stream that has not
-// failed and refuses one that has. A source that quit part-way or a chunk that
-// could not be written is sticky and Close reports it, so `defer w.Close()`
-// cannot silently turn an interrupted transfer into a valid short stream. What
-// it cannot know is a caller that changes its mind about a stream nothing went
-// wrong with; say that with [StreamWriter.Abort].
+// Close completes the stream only if nothing has failed. If a chunk could not
+// be written, or the source broke off during [StreamWriter.ReadFrom], Close
+// returns that error, so `defer w.Close()` never passes off a cut-short
+// transfer as a valid stream.
+//
+// Close can't catch errors it never sees. [io.Copy] uses the source's own
+// WriteTo when it has one (a [StreamReader] does), and then a source error
+// goes only to the caller. In that case, or if you simply no longer want the
+// stream, call [StreamWriter.Abort].
 func (s *Scheme) SealWriterAAD(masterKey []byte, dst io.Writer, aad []byte) (*StreamWriter, error) {
 	return s.sealWriter(masterKey, dst, plainStreamTag, aad)
 }
@@ -505,15 +508,16 @@ func (w *StreamWriter) ReadFrom(r io.Reader) (int64, error) {
 // its verdict if called again.
 //
 // Close finalizes only a stream that has not failed. Once anything has gone
-// wrong, a chunk that could not be written, a source that quit part-way, or an
-// [StreamWriter.Abort], the error is sticky and Close returns it without
-// writing a final chunk: sealing the remainder then would turn a partial
-// stream into a valid short one, which is the failure the final-chunk flag
-// exists to prevent.
+// wrong, a chunk that could not be written, a source that quit part-way while
+// [StreamWriter.ReadFrom] was reading it, or an [StreamWriter.Abort], the error
+// is sticky and Close returns it without writing a final chunk: sealing the
+// remainder then would turn a partial stream into a valid short one, which is
+// the failure the final-chunk flag exists to prevent.
 //
-// So `defer w.Close()` is safe on its own for detecting the problem, but it
+// So `defer w.Close()` is safe on its own for detecting what the writer saw,
+// but not a source failure that [io.Copy] reported only to its caller, and it
 // cannot express "I changed my mind about a stream that was going fine". Pair
-// it with `defer w.Abort()` for that; Abort after a successful Close does
+// it with `defer w.Abort()` for both; Abort after a successful Close does
 // nothing.
 func (w *StreamWriter) Close() error {
 	if w.closed {

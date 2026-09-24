@@ -10,8 +10,8 @@
 
 `crypt` wraps Go's standard `crypto` packages and `golang.org/x/crypto` so you
 can encrypt and decrypt data with well-established primitives without writing
-the fiddly plumbing yourself. Every function authenticates its output, generates
-nonces for you, and returns plain `[]byte` / `string` values.
+the fiddly plumbing yourself. Every symmetric cipher authenticates its output,
+generates nonces for you, and returns plain `[]byte` / `string` values.
 
 ![Diagram: the four paths through the library, the two package layers, the naming pattern every cipher follows, and the house rules](crypt-overview.png)
 
@@ -39,7 +39,7 @@ it lives in, then the one naming pattern the ciphers share.
 go get github.com/pilinux/crypt
 ```
 
-Requires **Go 1.25+**. The only external dependency is `golang.org/x/crypto`.
+Requires **Go 1.25+**. The only direct dependency is `golang.org/x/crypto`.
 
 ## Quick start
 
@@ -159,6 +159,7 @@ func main() {
 	kek, _ := scheme.DeriveKEK(os.Getenv("ENCRYPTION_SECRET"))
 	masterKey, _ := envelope.GenerateMasterKey()
 	wrapped, _ := envelope.WrapKey(kek, masterKey) // persist `wrapped`, not masterKey
+	envelope.Zero(kek)
 	_ = wrapped
 
 	// Per item: seal to a base64 token, then open it back.
@@ -198,7 +199,9 @@ _, err = scheme.OpenStream(masterKey, w, r)
 // Or take the writer/reader themselves and compose freely.
 sw, err := scheme.SealWriter(masterKey, dst) // io.WriteCloser
 defer sw.Abort()                             // no-op once Close has succeeded
-_, err = io.Copy(sw, src)
+if _, err := io.Copy(sw, src); err != nil {
+	return err // not every source failure reaches sw, so Close alone is not enough
+}
 err = sw.Close() // seals the final chunk; the stream is only complete after this
 
 sr, err := scheme.OpenReader(masterKey, src) // io.Reader
@@ -222,7 +225,7 @@ of allocations as sealing 1 KB. On the wire:
 sealed = 37 + plaintext + 16 * chunks     chunks = ceil(plaintext / ChunkSize), min 1
 ```
 
-That is a 37-byte header plus one 16-byte tag per chunk, so a 10 GB file at
+That is a 37-byte header plus one 16-byte tag per chunk, so a 10 GiB file at
 the default 1 MiB chunk size grows by 160 KiB, about 0.0015%. Larger chunks
 mean less overhead and more memory per stream; smaller chunks the reverse.
 `MinChunkSize` (1 KiB) keeps the worst case under 2%, and `MaxChunkSize`
@@ -246,31 +249,42 @@ _, err = scheme.OpenPaddedFileAAD(masterKey, "doc.out", "doc.enc", []byte("doc")
 _, err = scheme.SealPaddedStream(masterKey, w, r, size) // io.Writer <- io.Reader
 _, err = scheme.OpenPaddedStream(masterKey, w, r)
 
-// No length, but a seekable destination such as an *os.File.
+// No length, but an empty io.WriterAt destination such as a new *os.File.
 _, err = scheme.SealPaddedAt(masterKey, f, r) // io.WriterAt <- io.Reader
+
+// Pull the payload instead: Size comes from the authenticated frame before
+// any body is read, which is what a handler needs to set Content-Length.
+pr, err := scheme.OpenPaddedReader(masterKey, r) // io.ReadCloser
+length := pr.Size()                              // before a byte of body
+_, err = io.Copy(w, pr)
+err = pr.Close() // nil only if the payload was complete with authentic padding
 ```
 
-All three produce the same format, so a padded blob sealed one way opens the other.
-Padding costs no memory: the frame, the payload and the zero padding are pulled
-through the chunk sealer as it asks for them, so a padded 10 GB upload is
-sealed on the fly exactly like an unpadded one. The length is the one thing
-needed in advance, since it is written ahead of the payload and fixes the
-bucket: pass a `Content-Length`, a `len()`, or use the file form. A source that
-then delivers a different number of bytes fails with `ErrSourceSize` at the
-payload boundary, before a single byte of padding is written, which is what
-makes `size` safe to accept from an untrusted peer.
+All three sealers produce the same format, so a padded blob sealed one way
+opens every other way. Padding costs no memory: the frame, the payload and the
+zero padding are pulled through the chunk sealer as it asks for them, so a
+padded 10 GB upload is sealed on the fly exactly like an unpadded one.
+`SealPaddedStream` needs the length in advance, since it is written ahead of the
+payload and fixes the bucket: pass a `Content-Length`, a `len()`, or use the
+file form. A source that then delivers a different number of bytes fails with
+`ErrSourceShort` or `ErrSourceLong` (both match `ErrSourceSize`) at the payload
+boundary, before a single byte of padding is written, which is what makes
+`size` safe to accept from an untrusted peer. `SealPaddedAt` needs no length:
+it holds the chunk carrying the frame, seals it last and writes it back at its
+offset, at the cost of a second chunk of memory.
 
 The payload is framed as `version(1) || realLen(8) || payload || zero padding`
 and rounded up to a Padmé bucket (`PaddedSize`), destroying 12 to 25 bits of
-the length for about 1.4% extra storage. Measured over 162,524 real files: of
-those above 1 MB, 61% are uniquely identified by their exact size, 3.9% after
-padding. `OpenPaddedFile` reads the padding back and authenticates it before
-discarding it, so truncation inside the padding still fails.
+the length (for sizes from 128 KiB to 2 GiB) for 1 to 3% extra storage on
+average. In the [Padmé paper](https://arxiv.org/abs/1806.03160), 83% of Ubuntu
+packages and 87% of YouTube videos are uniquely identified by their exact size;
+after padding, 3%. Every opener reads the padding back, authenticates it and checks it is
+all zeros before discarding it, so truncation inside the padding still fails.
 
 **When the length is not knowable up front**, as with an HTML multipart upload
 (no per-part `Content-Length`, and the file is chosen after the page loads),
-write it into a file with `SealPaddedAt`, or, when the destination cannot seek,
-seal it unpadded and pad it afterwards:
+write it into a file with `SealPaddedAt`, or, when the destination is not an
+`io.WriterAt`, seal it unpadded and pad it afterwards:
 
 ```go
 // Request path: SealStream takes no size at all.
@@ -283,9 +297,9 @@ _, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
 ```
 
 Nothing has to carry `n` between the two stages: an unpadded stream is
-`StreamHeaderSize + n + 16*ceil(n/ChunkSize)` bytes, and `PlaintextLen` inverts
-that, so the sealed size gives the length back. A crash then leaves a valid sealed object rather than a lost upload.
-Which objects still owe a pass is the one thing this does not tell you for
+`StreamHeaderSize + n + 16*max(1, ceil(n/ChunkSize))` bytes, and `PlaintextLen` inverts
+that, so the sealed size gives the length back. A crash then leaves a valid
+sealed object rather than a lost upload. Which objects still owe a pass is the one thing this does not tell you for
 free: padded and plain blobs are deliberately indistinguishable, so an unpadded
 object opened as padded fails with `ErrStreamAuth`, exactly like a wrong key.
 Retry with `OpenStream` to identify it, or track the state alongside the object.
@@ -306,7 +320,7 @@ independently; use `RandomHex` names if that matters.
 | Let someone encrypt *to you* using your public key | **RSA-OAEP** | PEM key pair |
 | Protect many records under one rotatable secret | **`envelope`** subpackage | derived |
 | Encrypt a file too big to hold in memory | **`envelope`** streaming (`SealFile`, `SealWriter`) | derived |
-| Stop a file's size from identifying it | **`envelope`** padding (`SealPaddedFile`, `SealPaddedStream`) | derived |
+| Stop a file's size from identifying it | **`envelope`** padding (`SealPaddedFile`, `SealPaddedStream`, `SealPaddedAt`) | derived |
 
 ## API at a glance
 
@@ -317,9 +331,9 @@ independently; use `RandomHex` names if that matters.
 | XChaCha20-Poly1305 (`chaCha20.go`) | `EncryptXChacha20poly1305` / `DecryptXChacha20poly1305` (192-bit nonce) |
 | RSA-OAEP (`rsa.go`) | `Encoder.EncryptRSA` / `Decoder.DecryptRSA` (+ `Byte` variants) |
 | Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
-| Envelope (`envelope/`) | `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
+| Envelope (`envelope/`) | `New`/`Default`, `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `GenerateMasterKey`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
 | Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader`/`StreamWriter.Abort`/`StreamReader.Abort` (+ `AAD` variants), `StreamHeaderSize`, `PlaintextLen` |
-| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream`, `SealPaddedAt` (+ `AAD` variants), `PaddedSize` |
+| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream`, `SealPaddedAt`, `OpenPaddedReader` (+ `AAD` variants), `PaddedReader.Size`/`Close`, `PaddedSize` |
 
 The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
 `...AAD` forms that bind caller-supplied associated data (authenticated, not
@@ -338,14 +352,22 @@ with `go run ./_example/<name>`:
 - [XChaCha20-Poly1305 AEAD](_example/xchacha20poly1305/main.go)
 - [RSA](_example/rsa/main.go)
 - [Hashing](_example/hashing/main.go)
+- [TLS 1.3 mutual authentication](_example/tls/main.go): a PING/PONG exchange
+  over TLS using only the standard library, with a
+  [walkthrough of the handshake](_example/tls/README.md).
+- [Benchmark](_example/benchmark/main.go): an ad-hoc timing loop over the
+  ciphers, not `go test` benchmarks.
 - [Envelope encryption at rest](_example/envelope/main.go). Add `-serve
   127.0.0.1:8080` to skip the demos and start a small upload server
   ([server.go](_example/envelope/server.go)) instead, which pushes a real file
-  of your choosing through the streaming and padding APIs. It caps uploads at
-  1 GiB and keeps ciphertext in a temp dir; `-max 0 -dir /path` lifts both,
-  which is what a multi-gigabyte test needs; `-chunk` sets the chunk size
-  (default 1 MiB) and `-debug` logs how each padded upload is sealed. Verified at 5 GB, with the server
-  sitting at 8.9 MiB resident.
+  of your choosing through the streaming and padding APIs: an upload is padded
+  on the request path with `SealPaddedAtAAD`, and a download sets
+  `Content-Length` from `PaddedReader.Size`. It caps uploads at 1 GiB and keeps
+  ciphertext in a temp dir; `-max 0 -dir /path` lifts both, which is what a
+  multi-gigabyte test needs; `-chunk` sets the chunk size (default 1 MiB) and
+  `-debug` logs how each padded upload is sealed, payload length and first
+  bytes included. Verified at 5 GB, with the server sitting at 8.9 MiB
+  resident.
 
 ## Generate RSA keys
 
@@ -389,11 +411,13 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   encrypting many items under one key, prefer XChaCha20-Poly1305 or the
   `envelope` scheme, which give each item its own key or a large random nonce.
 - **Everything is authenticated.** All AEAD modes and RSA-OAEP fail closed:
-  tampered ciphertext or a wrong key returns an error, never partial plaintext.
-  In the `envelope` package that error is a sentinel: `ErrEnvelopeAuth` for a
-  token or a wrapped key, `ErrStreamAuth` for a stream. Neither says which of
+  tampered ciphertext or a wrong key returns an error, never partial plaintext
+  (streams are the exception; see below). In the `envelope` package an
+  authentication failure is a sentinel: `ErrEnvelopeAuth` for a token or a
+  wrapped key, `ErrStreamAuth` for a stream. Neither says which of
   "wrong key", "wrong AAD" or "altered bytes" it was, since telling those apart
-  is what an attacker probing a datastore would want.
+  is what an attacker probing a datastore would want. Input too damaged to
+  parse fails earlier, with an error such as `ErrBadEnvelope` or `ErrBadStream`.
 - **Fail closed on bad input, never panic.** The `Decrypt…` functions that take
   a nonce directly validate its length (12 bytes for AES-GCM and
   ChaCha20-Poly1305, 24 for XChaCha20-Poly1305) and return an error on a
@@ -408,19 +432,25 @@ openssl rsa -in private-key.pem -pubout -out public-key.pem
   has acted on data whose stream may still fail. Treat the destination as
   unusable until the call returns without error. `StreamWriter.Close`
   finalizes a stream that has not failed and refuses one that has, so a source
-  that quit part-way cannot be closed into a valid short stream. Use
-  `StreamWriter.Abort` for the case nothing failed and you simply do not want
-  the stream: `defer sw.Abort()` costs nothing once `Close` has succeeded.
-  `StreamReader.Abort` is the reading half: stop before the end and it wipes
-  the decrypted chunk the reader still holds.
+  that quit part-way cannot be closed into a valid short stream. That needs the
+  writer to see the failure: check `io.Copy`'s error too, because a source with
+  its own `WriteTo` method (a `StreamReader`, say) reports failures only to
+  `io.Copy`. Only `io.EOF`
+  counts as the end of a source: an `io.ErrUnexpectedEOF` from a cut-off HTTP
+  body fails the seal. Use `StreamWriter.Abort` for the case nothing failed and
+  you simply do not want the stream: `defer sw.Abort()` costs nothing once
+  `Close` has succeeded. `StreamReader.Abort` is the reading half: stop before
+  the end and it wipes the decrypted chunk the reader still holds. A
+  `PaddedReader` read for exactly `Size()` bytes has not checked its padding
+  yet; `Close` is where that happens.
 - **Ciphertext reveals its plaintext length.** Both formats store enough in the
   clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
   for a stream. Content, key and context stay hidden, but size alone can
   identify a known file. Use `SealPaddedFile` for files and
   `SealPaddedStream` for everything else; when the length is not known up
   front, use `SealPaddedAt` into a file, or seal unpadded and pad in a second
-  pass; `SealInt64` is already
-  fixed-width, and other tokens need padding before you seal them.
+  pass. `SealInt64` is already fixed-width, and other tokens need padding
+  before you seal them.
 - **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
   private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after
   `NewEncoder` / `NewDecoder`.

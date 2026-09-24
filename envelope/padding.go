@@ -57,7 +57,7 @@ var (
 	// ErrPaddingMalformed means the frame was read and the stream contradicts
 	// it: too little payload, a padding length PaddedSize would not produce, or
 	// padding that is not zeros. A stream simply cut short gives [ErrStreamAuth]
-	// instead.
+	// or [ErrBadStream] instead.
 	ErrPaddingMalformed = fmt.Errorf("%w: frame contradicts the payload it describes", ErrNotPadded)
 
 	// ErrSourceSize means a source could not supply the byte count the padding
@@ -371,7 +371,7 @@ func (s *Scheme) OpenPaddedReader(masterKey []byte, src io.Reader) (*PaddedReade
 // from the start.
 //
 // The frame is authenticated, but that says nothing about the rest of the
-// stream: truncation shows up later as [ErrStreamAuth], while
+// stream: truncation shows up later as [ErrStreamAuth] or [ErrBadStream], while
 // [ErrPaddingMalformed] means a stream that authenticates whole and still
 // disagrees with its own frame. A plain [Scheme.SealStream] blob fails here as
 // [ErrStreamAuth], the same as a wrong key; retry with [Scheme.OpenReaderAAD]
@@ -417,7 +417,8 @@ func (s *Scheme) OpenPaddedReaderAAD(masterKey []byte, src io.Reader, aad []byte
 
 // Size is the payload length from the stream's authenticated frame, known
 // before any payload byte is read. The frame is authentic, but the stream
-// behind it can still end early, with [ErrStreamAuth] or [ErrPaddingMalformed].
+// behind it can still end early, with [ErrStreamAuth], [ErrBadStream] or
+// [ErrPaddingMalformed].
 func (r *PaddedReader) Size() int64 { return r.size }
 
 // Read hands out the payload and never the padding. It returns [io.EOF] only

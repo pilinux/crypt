@@ -78,7 +78,7 @@
 //	        place, so nothing is allocated per chunk.
 //	size:   len(header) + plaintext + TagSize*chunks bytes, where
 //	        chunks = ceil(plaintext/chunkSize), at least one. That is 37 bytes
-//	        plus 16 bytes per chunk: 160 KiB of tags on a 10 GB file at the
+//	        plus 16 bytes per chunk: 160 KiB of tags on a 10 GiB file at the
 //	        default chunk size, about 0.0015%.
 //
 // Bigger chunks buy less overhead at the price of more memory per stream; the

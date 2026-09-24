@@ -278,6 +278,11 @@ func TestStreamIntegrity(t *testing.T) {
 			want:   ErrStreamAuth,
 		},
 		{
+			name:   "truncateToShortFragment",
+			mangle: func(b []byte) []byte { return b[:streamHeaderSize+chunk+TagSize-1] },
+			want:   ErrBadStream,
+		},
+		{
 			name: "swapTwoChunks",
 			mangle: func(b []byte) []byte {
 				first := b[streamHeaderSize : streamHeaderSize+chunk]
