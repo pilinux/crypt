@@ -108,30 +108,27 @@ func PlaintextLen(sealed int64, chunkSize int) (int64, bool) {
 	}
 	cs := int64(chunkSize)
 
-	body := sealed - StreamHeaderSize
-	if body < TagSize {
+	// compared before subtracting, which would wrap for sealed near MinInt64
+	if sealed < StreamHeaderSize+TagSize {
 		return 0, false
 	}
-	// The chunk count is bracketed tightly: at least body/(chunkSize+TagSize),
-	// since no chunk carries more than chunkSize plaintext plus its tag, and at
-	// most body/chunkSize+1, since the plaintext is no longer than the body.
-	for chunks := body / (cs + TagSize); chunks <= body/cs+1; chunks++ {
-		if chunks < 1 {
-			continue
-		}
-		n := body - TagSize*chunks
-		if n < 0 {
-			return 0, false
-		}
-		want := n/cs + 1
-		if n > 0 && n%cs == 0 {
-			want = n / cs
-		}
-		if want == chunks {
-			return n, true
-		}
+	body := sealed - StreamHeaderSize
+	// Every chunk but the last is chunkSize+TagSize bytes and the last is
+	// TagSize plus 1..chunkSize (0 only for an empty stream), so the count
+	// follows from the body directly; a search here would run for hours on an
+	// impossible size near MaxInt64. body == TagSize gives -1/(cs+TagSize),
+	// which truncates to 0: one chunk.
+	chunks := (body-TagSize-1)/(cs+TagSize) + 1
+	n := body - TagSize*chunks
+	want := n/cs + 1
+	if n > 0 && n%cs == 0 {
+		want = n / cs
 	}
-	return 0, false
+	if want != chunks {
+		// no plaintext length seals to this size
+		return 0, false
+	}
+	return n, true
 }
 
 // Stream format tags. Every stream authenticates one of these, hashed together
@@ -315,12 +312,26 @@ func writeAll(dst io.Writer, p []byte) error {
 
 // readFull fills p from r like io.ReadFull, but returns r's error as is.
 // io.ReadFull reports a partial end as io.ErrUnexpectedEOF, the same error a
-// cut-off HTTP or multipart body returns.
+// cut-off HTTP or multipart body returns. r is caller-supplied, so a count
+// outside 0..len(p) is errBadReadCount rather than a slice bound, and a reader
+// stuck on (0, nil) gets io.ErrNoProgress, as in exactReader, not a spin.
 func readFull(r io.Reader, p []byte) (n int, err error) {
+	empty := 0
 	for n < len(p) && err == nil {
 		var m int
 		m, err = r.Read(p[n:])
+		if m < 0 || m > len(p)-n {
+			return n, errBadReadCount
+		}
 		n += m
+		if m > 0 {
+			empty = 0
+		} else if err == nil {
+			empty++
+			if empty >= maxConsecutiveEmptyReads {
+				return n, io.ErrNoProgress
+			}
+		}
 	}
 	return n, err
 }
@@ -486,7 +497,7 @@ func (w *StreamWriter) ReadFrom(r io.Reader) (int64, error) {
 
 		// the buffer is full, but a full buffer is only a non-final chunk if
 		// something follows it, so seal it only after reading the next byte.
-		switch m, err := io.ReadFull(r, w.next[:]); {
+		switch m, err := readFull(r, w.next[:]); {
 		case m == 1:
 		case errors.Is(err, io.EOF):
 			return total, nil
@@ -669,7 +680,7 @@ func (s *Scheme) openReader(masterKey []byte, src io.Reader, tag string, aad []b
 	}
 
 	header := make([]byte, streamHeaderSize)
-	if _, err := io.ReadFull(src, header); err != nil {
+	if _, err := readFull(src, header); err != nil {
 		// too short to be a stream; anything else is the caller's I/O error
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, ErrBadStream
@@ -789,11 +800,11 @@ func (r *StreamReader) readChunk() error {
 		n = 1
 	}
 
-	m, err := io.ReadFull(r.src, r.buf[n:])
+	m, err := readFull(r.src, r.buf[n:])
 	n += m
 	switch {
 	case err == nil:
-		switch k, e := io.ReadFull(r.src, r.carry[:]); {
+		switch k, e := readFull(r.src, r.carry[:]); {
 		case k == 1:
 			r.hasCarry = true
 		case errors.Is(e, io.EOF):

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"testing"
 	"time"
 )
@@ -1244,7 +1246,7 @@ func TestPlaintextLenInvertsSealedSize(t *testing.T) {
 	})
 
 	t.Run("rejectsWhatCannotBeAStream", func(t *testing.T) {
-		for _, sealed := range []int64{0, 1, StreamHeaderSize, StreamHeaderSize + TagSize - 1, -100} {
+		for _, sealed := range []int64{0, 1, StreamHeaderSize, StreamHeaderSize + TagSize - 1, -100, math.MinInt64, math.MinInt64 + 36} {
 			if _, ok := PlaintextLen(sealed, MinChunkSize); ok {
 				t.Errorf("sealed %d was accepted", sealed)
 			}
@@ -1254,6 +1256,208 @@ func TestPlaintextLenInvertsSealedSize(t *testing.T) {
 		}
 		if _, ok := PlaintextLen(1<<20, MaxChunkSize+1); ok {
 			t.Error("an out-of-range chunk size was accepted")
+		}
+	})
+
+	// every sealed size in range, possible or not, against the forward formula
+	t.Run("everySealedSizeMatchesTheFormat", func(t *testing.T) {
+		for _, cs := range []int{MinChunkSize, 1100} {
+			c := int64(cs)
+			want := map[int64]int64{}
+			for n := int64(0); n <= 5*c; n++ {
+				chunks := max(1, (n+c-1)/c)
+				want[StreamHeaderSize+n+TagSize*chunks] = n
+			}
+			for sealed := int64(-1); sealed <= StreamHeaderSize+5*c+TagSize*5; sealed++ {
+				n, ok := PlaintextLen(sealed, cs)
+				wn, wok := want[sealed]
+				if ok != wok || n != wn {
+					t.Fatalf("chunk %d, sealed %d: got (%d, %v), want (%d, %v)", cs, sealed, n, ok, wn, wok)
+				}
+			}
+		}
+	})
+
+	// an impossible size near MaxInt64 used to be searched one candidate at a
+	// time, about 1.4e14 of them at 1 KiB chunks
+	t.Run("impossibleHugeSizeReturnsAtOnce", func(t *testing.T) {
+		c := int64(MinChunkSize)
+		sealed := StreamHeaderSize + (math.MaxInt64-StreamHeaderSize)/(c+TagSize)*(c+TagSize) - (c + TagSize) + 5
+		err := runBounded(t, func() error {
+			if _, ok := PlaintextLen(sealed, MinChunkSize); ok {
+				return errors.New("an impossible size was accepted")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+// lookAheadOverrun is an honest bytes.Reader except that a one-byte read
+// reports two bytes, breaking the io.Reader count contract only on the
+// writer's look-ahead.
+type lookAheadOverrun struct{ r *bytes.Reader }
+
+func (l *lookAheadOverrun) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if len(p) == 1 && n == 1 {
+		return 2, err
+	}
+	return n, err
+}
+
+// TestSealStreamRejectsOverrunLookAhead: the look-ahead used to take (2, nil)
+// from io.ReadFull as a clean end, so Close sealed the first chunk as final and
+// SealStream reported a truncated stream as a success.
+func TestSealStreamRejectsOverrunLookAhead(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, 5*testChunkSize)
+
+	var sealed bytes.Buffer
+	_, err := s.SealStream(masterKey, &sealed, &lookAheadOverrun{r: bytes.NewReader(payload)})
+	if !errors.Is(err, errBadReadCount) {
+		t.Fatalf("err = %v, want errBadReadCount", err)
+	}
+	if _, err := openStream(s, masterKey, sealed.Bytes(), nil); err == nil {
+		t.Error("the abandoned stream opens as a complete one")
+	}
+}
+
+// negativeReader returns a negative count, which the io.Reader contract forbids.
+type negativeReader struct{}
+
+func (negativeReader) Read([]byte) (int, error) { return -1, nil }
+
+// TestStreamRejectsInvalidReadCounts: every path that reads a caller's source
+// used to trust its count, and a bad one panicked on a slice bound or, in the
+// reader's look-ahead, came back as (2, nil) and made readChunk skip the chunk
+// and loop forever. Only exactReader checked it; now readFull does, for the
+// writer and the reader.
+func TestStreamRejectsInvalidReadCounts(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	sealed, _ := seal(t, s, masterKey, 3*testChunkSize, nil)
+
+	cases := map[string]func() error{
+		"SealStream, negative count": func() error {
+			_, err := s.SealStream(masterKey, io.Discard, negativeReader{})
+			return err
+		},
+		"SealPaddedAt, overrun": func() error {
+			_, err := s.SealPaddedAt(masterKey, &atRecorder{}, overrunReader{})
+			return err
+		},
+		"OpenStream, overrun in the header": func() error {
+			_, err := s.OpenStream(masterKey, io.Discard, overrunReader{})
+			return err
+		},
+		"OpenStream, overrun in a chunk": func() error {
+			src := io.MultiReader(bytes.NewReader(sealed[:streamHeaderSize]), overrunReader{})
+			_, err := s.OpenStream(masterKey, io.Discard, src)
+			return err
+		},
+	}
+	for name, run := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := runBounded(t, run); !errors.Is(err, errBadReadCount) {
+				t.Errorf("err = %v, want errBadReadCount", err)
+			}
+		})
+	}
+}
+
+// runBounded runs fn off the test goroutine, so a regression that spins fails
+// in seconds instead of at the package test timeout, and reports a panic as an
+// error.
+func runBounded(t *testing.T, fn func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("panicked instead of failing closed: %v", r)
+			}
+		}()
+		done <- fn()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("never returned")
+		return nil
+	}
+}
+
+// trickleReader hands out one byte at a time with gap (0, nil) reads before
+// each: slow, but always progressing.
+type trickleReader struct {
+	r    io.Reader
+	gap  int
+	idle int
+}
+
+func (tr *trickleReader) Read(p []byte) (int, error) {
+	if tr.idle < tr.gap {
+		tr.idle++
+		return 0, nil
+	}
+	tr.idle = 0
+	return tr.r.Read(p[:min(len(p), 1)])
+}
+
+// TestStreamRejectsStalledSource: a source answering (0, nil) forever is legal,
+// and only the padded sealer's exactReader used to give up on one. The writer,
+// the reader and SealPaddedAt spun on it. The bound is on consecutive empty
+// reads, so a source that stalls often but keeps delivering still works.
+func TestStreamRejectsStalledSource(t *testing.T) {
+	s := streamScheme()
+	masterKey := newMasterKey(t)
+	payload := randomData(t, 2*testChunkSize+5)
+	sealed, _ := seal(t, s, masterKey, 2*testChunkSize+5, nil)
+
+	cases := map[string]func() error{
+		"SealStream": func() error {
+			_, err := s.SealStream(masterKey, io.Discard, &deadReader{r: bytes.NewReader(payload)})
+			return err
+		},
+		"SealPaddedAt": func() error {
+			_, err := s.SealPaddedAt(masterKey, &atRecorder{}, &deadReader{r: bytes.NewReader(payload)})
+			return err
+		},
+		"OpenStream": func() error {
+			src := io.MultiReader(bytes.NewReader(sealed[:streamHeaderSize]), stalledFill{})
+			_, err := s.OpenStream(masterKey, io.Discard, src)
+			return err
+		},
+	}
+	for name, run := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := runBounded(t, run); !errors.Is(err, io.ErrNoProgress) {
+				t.Errorf("err = %v, want io.ErrNoProgress", err)
+			}
+		})
+	}
+
+	t.Run("slowButProgressing", func(t *testing.T) {
+		gap := maxConsecutiveEmptyReads - 1
+		var out bytes.Buffer
+		err := runBounded(t, func() error {
+			var buf bytes.Buffer
+			if _, err := s.SealStream(masterKey, &buf, &trickleReader{r: bytes.NewReader(payload), gap: gap}); err != nil {
+				return err
+			}
+			_, err := s.OpenStream(masterKey, &out, &trickleReader{r: &buf, gap: gap})
+			return err
+		})
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !bytes.Equal(out.Bytes(), payload) {
+			t.Error("round-tripped payload differs")
 		}
 	})
 }
