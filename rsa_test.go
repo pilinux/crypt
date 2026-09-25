@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"testing"
 )
 
@@ -233,4 +234,24 @@ func TestRSAMalformedKeyBytes(t *testing.T) {
 			t.Error("DecryptRSA with malformed key bytes succeeded, want failure")
 		}
 	})
+}
+
+// TestRSAMissingKey: a failed NewEncoder/NewDecoder, or a zero value, used to
+// panic on the nil PEM block. Now the constructor's own error comes back.
+func TestRSAMissingKey(t *testing.T) {
+	enc := NewEncoder("not a pem")
+	if _, err := enc.EncryptRSA("x"); err == nil || !errors.Is(err, enc.Err) {
+		t.Errorf("EncryptRSA err = %v, want the constructor's %v", err, enc.Err)
+	}
+	dec := NewDecoder("not a pem")
+	if _, err := dec.DecryptRSA([]byte("x")); err == nil || !errors.Is(err, dec.Err) {
+		t.Errorf("DecryptRSA err = %v, want the constructor's %v", err, dec.Err)
+	}
+
+	if _, err := (&Encoder{}).EncryptRSA("x"); err == nil {
+		t.Error("a zero Encoder encrypted without a key")
+	}
+	if _, err := (&Decoder{}).DecryptRSA([]byte("x")); err == nil {
+		t.Error("a zero Decoder decrypted without a key")
+	}
 }

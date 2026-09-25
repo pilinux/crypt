@@ -31,6 +31,16 @@ func (h HashAlgorithm) hash() (crypto.Hash, error) {
 
 // EncryptByteRSA encrypts the given message (bytes) with RSA-OAEP and using SHA-256 (default) or SHA-512.
 func (e *Encoder) EncryptByteRSA(input []byte) (ciphertext []byte, err error) {
+	// a failed NewEncoder, or a zero Encoder, has no key to parse
+	if e.Err != nil {
+		err = e.Err
+		return
+	}
+	if e.PubKeyBlock == nil {
+		err = fmt.Errorf("no public key: create the Encoder with NewEncoder")
+		return
+	}
+
 	pubKey, err := x509.ParsePKIXPublicKey(e.PubKeyBlock.Bytes)
 	if err != nil {
 		err = fmt.Errorf("error parsing public key: %v", err)
@@ -71,6 +81,16 @@ func (e *Encoder) EncryptRSA(text string) (ciphertext []byte, err error) {
 
 // DecryptByteRSA decrypts the given message with RSA-OAEP and using SHA-256 (default) or SHA-512.
 func (d *Decoder) DecryptByteRSA(ciphertext []byte) (plaintext []byte, err error) {
+	// a failed NewDecoder, or a zero Decoder, has no key to parse
+	if d.Err != nil {
+		err = d.Err
+		return
+	}
+	if d.PriKeyBlock == nil {
+		err = fmt.Errorf("no private key: create the Decoder with NewDecoder")
+		return
+	}
+
 	priKey, err := x509.ParsePKCS8PrivateKey(d.PriKeyBlock.Bytes)
 	if err != nil {
 		err = fmt.Errorf("error parsing private key: %v", err)
