@@ -17,6 +17,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.26.x", "1.27.x"]
 
     steps:
       - name: Checkout repository
@@ -25,7 +29,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.25.x
+          go-version: ${{ matrix.go-version }}
           cache: true
       - run: go version
 
@@ -55,8 +59,9 @@ jobs:
       - name: Test
         run: go test -race -v -cover -coverpkg=./... -coverprofile=coverage.txt -covermode=atomic ./...
 
+      # one upload per commit, from the newest Go
       - name: Upload coverage reports to Codecov
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.go-version == '1.27.x'
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

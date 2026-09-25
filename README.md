@@ -16,7 +16,7 @@ and an envelope-encryption package for data at rest.
 go get github.com/pilinux/crypt
 ```
 
-Requires **Go 1.25+**. The only dependency is `golang.org/x/crypto`.
+Requires **Go 1.26+**. The only dependency is `golang.org/x/crypto`.
 
 ## What to use
 
