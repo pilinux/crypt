@@ -61,4 +61,11 @@ func TestRandomHex(t *testing.T) {
 			t.Error("two RandomHex values are identical")
 		}
 	})
+
+	// used to panic in make
+	t.Run("negative", func(t *testing.T) {
+		if id, err := RandomHex(-1); err == nil {
+			t.Errorf("RandomHex(-1) = %q, want an error", id)
+		}
+	})
 }

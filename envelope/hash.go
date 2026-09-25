@@ -3,6 +3,7 @@ package envelope
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 )
 
 // Sha256Hex returns the lowercase hex-encoded SHA-256 digest of data. It is
@@ -18,6 +19,9 @@ func Sha256Hex(data []byte) string {
 // resulting string is 2*n characters long). It is handy for minting
 // unpredictable IDs that double as safe on-disk filenames.
 func RandomHex(n int) (string, error) {
+	if n < 0 {
+		return "", errors.New("envelope: RandomHex length must not be negative")
+	}
 	b, err := randomBytes(n)
 	if err != nil {
 		return "", err
