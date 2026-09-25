@@ -1,6 +1,12 @@
 # crypt/envelope
 
-Envelope encryption on top of the root `crypt` primitives.
+Envelope encryption for data at rest, built on the root `crypt` package.
+
+You keep one secret outside your database. It wraps a random master key, which
+you store alongside your data. Every value you seal gets its own key, derived
+from the master key and a random salt, and is encrypted with
+XChaCha20-Poly1305. Rotating the secret means re-wrapping the master key and
+nothing else.
 
 ![Diagram: the key ladder, the three ways to seal (single-shot, streaming, padded stream), and the open path that mirrors them](envelope-flow.png)
 
@@ -69,23 +75,24 @@ email, err := scheme.OpenStringAAD(masterKey, token, aad)
 n, err := scheme.SealFileAAD(masterKey, "report.pdf.enc", "report.pdf", aad)
 n, err = scheme.OpenFileAAD(masterKey, "report.opened.pdf", "report.pdf.enc", aad)
 
-// Writer and reader.
+// Writer. Check io.Copy's error; only Close finishes the stream.
 w, err := scheme.SealWriterAAD(masterKey, dst, aad)
-defer w.Abort()          // no-op once Close has succeeded
+defer w.Abort() // does nothing after a successful Close
 if _, err := io.Copy(w, src); err != nil {
-	return err           // check it: see "Only Close completes a stream" below
+	return err
 }
-err = w.Close()          // the only thing that completes a stream
+err = w.Close()
 
+// Reader.
 r, err := scheme.OpenReaderAAD(masterKey, src, aad)
-defer r.Abort()          // wipes the decrypted chunk if you stop early
+defer r.Abort() // wipes the decrypted chunk if you stop early
 _, err = io.Copy(dst, r)
 
-// Padded, with the payload size known before the body (Content-Length).
+// Padded reader. The payload size is known before you read the body.
 pr, err := scheme.OpenPaddedReaderAAD(masterKey, src, aad)
-length := pr.Size()
+length := pr.Size() // e.g. for Content-Length
 _, err = io.Copy(dst, pr)
-err = pr.Close()         // nil: payload complete and padding authentic
+err = pr.Close() // checks the padding
 ```
 
 ## Keys
@@ -299,7 +306,7 @@ size is unknown, seal plain now and pad later:
 ```go
 _, err := scheme.SealStreamAAD(masterKey, dst, part, aad) // request path
 
-n, ok := envelope.PlaintextLen(sealedSize, chunkSize)    // later
+n, ok := envelope.PlaintextLen(sealedSize, chunkSize) // later
 r, err := scheme.OpenReaderAAD(masterKey, src, aad)
 _, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
 ```
@@ -332,9 +339,11 @@ it was.
 
 ## Rules worth knowing
 
-- **Labels are frozen, `ChunkSize` is not.** Every stream records its own chunk size.
-- **Output is provisional until the call returns `nil`.** Chunks reach `dst` as
-  they authenticate. `SealFile`/`OpenFile` and the padded file forms remove a
+- **Some things can never change.** The labels, `padme` and the two format tags
+  are baked into every sealed value; changing one makes existing data
+  unreadable. `ChunkSize` is fine to change, since each stream records its own.
+- **Don't trust output until the call returns nil.** Chunks reach `dst` as
+  they are verified. `SealFile`/`OpenFile` and the padded file forms remove a
   partial destination; with a stream, discard `dst` yourself.
 - **Only `Close` completes a stream, and only if nothing failed.** A source
   error that the writer reads itself, including `io.ErrUnexpectedEOF` from a
