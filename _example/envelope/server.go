@@ -114,6 +114,8 @@ type store struct {
 	// mu guards objs and order. Nothing escapes it: objs holds objects by
 	// value and every accessor copies, so there is no pointer a handler could
 	// still be reading while another writes through it.
+	// It also covers swapping in a padded file, so the file and its Padded
+	// flag change together.
 	mu    sync.Mutex
 	objs  map[string]object
 	order []string
@@ -175,9 +177,8 @@ func (s *store) beginPad(id string) (o object, claimed bool) {
 	return o, true
 }
 
-// endPad releases a claim. sealed > 0 records a finished pad; 0 abandons it, so
-// a failed attempt can be retried.
-func (s *store) endPad(id string, sealed int64) {
+// endPad releases a claim, finished or not; a failed attempt can be retried.
+func (s *store) endPad(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	o, ok := s.objs[id]
@@ -185,10 +186,34 @@ func (s *store) endPad(id string, sealed int64) {
 		return
 	}
 	o.padding = false
-	if sealed > 0 {
-		o.Padded, o.Sealed = true, sealed
-	}
 	s.objs[id] = o
+}
+
+// commitPad replaces the plain file with the padded one and sets Padded, while
+// holding the lock, so a download never sees the new file with the old flag.
+func (s *store) commitPad(id, tmpPath string, sealed int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.Rename(tmpPath, s.path(id)); err != nil {
+		return err
+	}
+	o := s.objs[id]
+	o.Padded, o.Sealed = true, sealed
+	s.objs[id] = o
+	return nil
+}
+
+// open returns an object and its open file, both taken under the lock so they
+// always match; see commitPad.
+func (s *store) open(id string) (object, *os.File, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.objs[id]
+	if !ok {
+		return o, nil, os.ErrNotExist
+	}
+	f, err := os.Open(s.path(id))
+	return o, f, err
 }
 
 // serve runs the upload server until interrupted. dir is where ciphertext goes
@@ -464,8 +489,7 @@ func (s *store) pad(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	sealed := int64(0)
-	defer func() { s.endPad(id, sealed) }()
+	defer s.endPad(id)
 
 	src, err := os.Open(s.path(id))
 	if err != nil {
@@ -500,20 +524,18 @@ func (s *store) pad(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "padding: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := os.Rename(tmp.Name(), s.path(id)); err != nil {
+	info, err := os.Stat(tmp.Name())
+	if err == nil {
+		err = s.commitPad(id, tmp.Name(), info.Size())
+	}
+	if err != nil {
 		_ = os.Remove(tmp.Name())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	syncDir(s.dir) // make the rename itself durable
 
-	info, err := os.Stat(s.path(id))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	sealed = info.Size() // the deferred endPad records it
-	logChunks(id, sealed)
+	logChunks(id, info.Size())
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -534,13 +556,11 @@ func syncDir(dir string) {
 // the file says which it is.
 func (s *store) download(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	o, ok := s.get(id)
-	if !ok {
+	o, src, err := s.open(id)
+	if errors.Is(err, os.ErrNotExist) {
 		http.NotFound(w, r)
 		return
 	}
-
-	src, err := os.Open(s.path(id))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
