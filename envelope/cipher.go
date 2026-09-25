@@ -134,7 +134,9 @@ func (s *Scheme) OpenString(masterKey []byte, token string) (string, error) {
 // the aad must match the value used at sealing time.
 func (s *Scheme) OpenStringAAD(masterKey []byte, token string, aad []byte) (string, error) {
 	blob, err := base64.StdEncoding.DecodeString(token)
-	if err != nil {
+	// The decoder skips CR/LF and ignores stray padding bits, so several
+	// strings can decode to one blob. Accept only the spelling SealString wrote.
+	if err != nil || base64.StdEncoding.EncodeToString(blob) != token {
 		return "", ErrBadEnvelope
 	}
 
@@ -183,7 +185,8 @@ func (s *Scheme) OpenInt64(masterKey []byte, token string) (int64, error) {
 // integer encoding.
 func (s *Scheme) OpenInt64AAD(masterKey []byte, token string, aad []byte) (int64, error) {
 	blob, err := base64.StdEncoding.DecodeString(token)
-	if err != nil {
+	// only the exact spelling SealInt64 wrote, as in OpenStringAAD
+	if err != nil || base64.StdEncoding.EncodeToString(blob) != token {
 		return 0, ErrBadEnvelope
 	}
 

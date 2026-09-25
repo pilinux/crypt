@@ -3,6 +3,7 @@ package envelope
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -368,5 +369,48 @@ func TestOpenReportsAuthFailure(t *testing.T) {
 				t.Error("an authentication failure must not report ErrBadEnvelope")
 			}
 		})
+	}
+}
+
+// TestOpenRejectsNonCanonicalTokens: the base64 decoder skips CR/LF and
+// ignores unused padding bits, so these respellings used to open like the
+// original token.
+func TestOpenRejectsNonCanonicalTokens(t *testing.T) {
+	s := Default()
+	masterKey := newMasterKey(t)
+
+	// "abc" makes a 61-byte blob, so the token ends in "==" and the character
+	// before it has four unused low bits; +1 in the alphabet sets one of them
+	str, err := s.SealString(masterKey, "abc")
+	if err != nil {
+		t.Fatalf("SealString error: %v", err)
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	i := strings.IndexByte(str, '=') - 1
+	stray := str[:i] + string(alphabet[strings.IndexByte(alphabet, str[i])+1]) + str[i+1:]
+
+	for name, tok := range map[string]string{
+		"crlf":               str[:10] + "\r\n" + str[10:],
+		"stray padding bits": stray,
+	} {
+		if _, err := s.OpenString(masterKey, tok); !errors.Is(err, ErrBadEnvelope) {
+			t.Errorf("%s: err = %v, want ErrBadEnvelope", name, err)
+		}
+	}
+
+	num, err := s.SealInt64(masterKey, 42)
+	if err != nil {
+		t.Fatalf("SealInt64 error: %v", err)
+	}
+	if _, err := s.OpenInt64(masterKey, num[:10]+"\n"+num[10:]); !errors.Is(err, ErrBadEnvelope) {
+		t.Errorf("int64 with newline: err = %v, want ErrBadEnvelope", err)
+	}
+
+	// the tokens as sealed still open
+	if got, err := s.OpenString(masterKey, str); err != nil || got != "abc" {
+		t.Errorf("OpenString = (%q, %v), want abc", got, err)
+	}
+	if got, err := s.OpenInt64(masterKey, num); err != nil || got != 42 {
+		t.Errorf("OpenInt64 = (%d, %v), want 42", got, err)
 	}
 }
