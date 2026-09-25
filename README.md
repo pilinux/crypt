@@ -1,37 +1,14 @@
 # crypt
 
-> Batteries-included encryption for Go: AEAD ciphers, RSA, and a ready-made
-> envelope-encryption scheme, all behind a small, hard-to-misuse API.
+Encryption for Go: AES-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305, RSA-OAEP,
+and an envelope-encryption package for data at rest.
 
 [![Go Reference][1]][2]
 [![DeepWiki][3]][4]
 [![CodeQL][5]](https://github.com/pilinux/crypt/actions/workflows/codeql-analysis.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)][6]
 
-`crypt` wraps Go's standard `crypto` packages and `golang.org/x/crypto` so you
-can encrypt and decrypt data with well-established primitives without writing
-the fiddly plumbing yourself. Every symmetric cipher authenticates its output,
-generates nonces for you, and returns plain `[]byte` / `string` values.
-
 ![Diagram: the four paths through the library, the two package layers, the naming pattern every cipher follows, and the house rules](crypt-overview.png)
-
-The whole library on one page: pick a path at the top, find the package and file
-it lives in, then the one naming pattern the ciphers share.
-
-## Features
-
-- **AES-GCM**: AES-128/192/256 authenticated encryption.
-- **ChaCha20-Poly1305**: fast AEAD with a 96-bit nonce.
-- **XChaCha20-Poly1305**: AEAD with a 192-bit nonce, safe for huge numbers of
-  messages under one key.
-- **RSA-OAEP**: public-key encryption with SHA-256 (default) or SHA-512.
-- **Base64 helpers**: Std, RawStd, URL and RawURL encoders/decoders.
-- **`envelope` subpackage**: a complete KEK/DEK envelope-encryption scheme for
-  protecting many records under a single rotatable secret.
-- **Streaming**: chunked XChaCha20-Poly1305 for files that do not fit in
-  memory, with constant memory use and no size ceiling.
-- **Length hiding**: pad a payload before sealing so its size stops
-  identifying it.
 
 ## Install
 
@@ -39,421 +16,163 @@ it lives in, then the one naming pattern the ciphers share.
 go get github.com/pilinux/crypt
 ```
 
-Requires **Go 1.25+**. The only direct dependency is `golang.org/x/crypto`.
+Requires **Go 1.25+**. The only dependency is `golang.org/x/crypto`.
 
-## Quick start
+## What to use
 
-### Symmetric encryption (AES-256-GCM)
+| Goal | Use |
+| --- | --- |
+| Encrypt with a key you already have | AES-256-GCM or XChaCha20-Poly1305 |
+| Encrypt a lot of messages under one key | XChaCha20-Poly1305 |
+| Let others encrypt data that only you can read | RSA-OAEP |
+| Keep many records under one secret you can rotate | [`envelope`](envelope/README.md) |
+| Encrypt files too big for memory, or hide their size | [`envelope`](envelope/README.md) streaming and padding |
+
+## Symmetric encryption
 
 ```go
-package main
+// crypt does not derive keys. Here Argon2id turns a passphrase into a
+// 32-byte key; keep the salt, you need it to derive the same key again.
+salt := make([]byte, 16)
+rand.Read(salt)
+key := argon2.IDKey([]byte("passphrase"), salt, 2, 64*1024, 2, 32)
 
-import (
-	"crypto/rand"
-	"fmt"
+ciphertext, err := crypt.EncryptAesGcmWithNonceAppended(key, "attack at dawn")
+if err != nil {
+	return err
+}
 
-	"golang.org/x/crypto/argon2"
-
-	"github.com/pilinux/crypt"
-)
-
-func main() {
-	// 1. Derive a 32-byte key. crypt never derives keys for you;
-	//    bring your own KDF (here: Argon2id over a passphrase).
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		panic(err)
-	}
-	key := argon2.IDKey([]byte("s3cr3t-passphrase"), salt, 2, 64*1024, 2, 32)
-
-	// 2. Encrypt. A random nonce is generated and prepended to the
-	//    ciphertext, so you only ever store a single blob.
-	ciphertext, err := crypt.EncryptAesGcmWithNonceAppended(key, "attack at dawn")
-	if err != nil {
-		panic(err)
-	}
-
-	// 3. Decrypt. This also verifies authenticity: any tampering
-	//    (or a wrong key) returns an error instead of garbage.
-	plaintext, err := crypt.DecryptAesGcmWithNonceAppended(key, ciphertext)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println(plaintext) // attack at dawn
+plaintext, err := crypt.DecryptAesGcmWithNonceAppended(key, ciphertext)
+if err != nil {
+	return err // wrong key, or the ciphertext was changed
 }
 ```
 
-Every symmetric cipher follows the same four-way naming pattern, so once you
-know one you know them all:
+Each cipher has the same four encrypt functions, plus the matching `Decrypt`
+ones:
 
-| Variant | Input / output | Nonce |
+| Function | Data | Nonce |
 | --- | --- | --- |
 | `Encrypt<Cipher>` | `string` | returned separately |
 | `EncryptByte<Cipher>` | `[]byte` | returned separately |
-| `Encrypt<Cipher>WithNonceAppended` | `string` | prepended to ciphertext |
-| `EncryptByte<Cipher>WithNonceAppended` | `[]byte` | prepended to ciphertext |
+| `Encrypt<Cipher>WithNonceAppended` | `string` | stored at the start of the ciphertext |
+| `EncryptByte<Cipher>WithNonceAppended` | `[]byte` | stored at the start of the ciphertext |
 
-Swap `EncryptAesGcm` for `EncryptXChacha20poly1305` (or the ChaCha20 variant) to
-change algorithms; the shape is identical.
+`<Cipher>` is `AesGcm`, `Chacha20poly1305` or `XChacha20poly1305`. The two
+ChaCha ciphers also have `EncryptByte...WithNonceAppendedAAD`, which binds extra
+data such as a record ID to the ciphertext without encrypting it.
 
-### Public-key encryption (RSA-OAEP)
+## RSA
 
 ```go
-// publicKeyPEM / privateKeyPEM are strings loaded from .pem files
-// (PKIX "PUBLIC KEY" and PKCS#8 "PRIVATE KEY" blocks; see below).
-
 enc := crypt.NewEncoder(publicKeyPEM)
 if enc.Err != nil {
-	panic(enc.Err) // the constructor reports PEM problems via .Err
+	return enc.Err
 }
-
 ciphertext, err := enc.EncryptRSA("attack at dawn")
-if err != nil {
-	panic(err)
-}
 
 dec := crypt.NewDecoder(privateKeyPEM)
 if dec.Err != nil {
-	panic(dec.Err)
+	return dec.Err
 }
-
 plaintext, err := dec.DecryptRSA(ciphertext)
-if err != nil {
-	panic(err)
-}
-
-// Want SHA-512 instead of the SHA-256 default? Set it on both sides:
-//   enc.HashAlg = crypt.SHA512
-//   dec.HashAlg = crypt.SHA512
 ```
 
-### Envelope encryption (many records, one rotatable secret)
+OAEP uses SHA-256 by default. For SHA-512, set `enc.HashAlg = crypt.SHA512` and
+the same on `dec`.
 
-Use the [`envelope`](https://pkg.go.dev/github.com/pilinux/crypt/envelope)
-subpackage when you need to protect lots of items (rows, files, fields) and be
-able to rotate the top-level secret without re-encrypting everything.
-
-```go
-package main
-
-import (
-	"fmt"
-	"os"
-
-	"github.com/pilinux/crypt/envelope"
-)
-
-func main() {
-	// Configure once with your app's domain-separation labels.
-	scheme := envelope.New(envelope.Config{
-		KEKLabel:    "myapp:kek:v1",
-		SubKeyLabel: "myapp:data-subkey:v1",
-	})
-
-	// Bootstrap: derive a key-encryption key (KEK) from a rotatable secret,
-	// then generate a master key and store it *wrapped*. (Errors omitted
-	// for brevity; handle them in real code.)
-	// The secret must be machine-generated randomness, >= 32 bytes
-	// (e.g. `openssl rand -hex 32`), never a human-chosen passphrase.
-	kek, _ := scheme.DeriveKEK(os.Getenv("ENCRYPTION_SECRET"))
-	masterKey, _ := envelope.GenerateMasterKey()
-	wrapped, _ := envelope.WrapKey(kek, masterKey) // persist `wrapped`, not masterKey
-	envelope.Zero(kek)
-	_ = wrapped
-
-	// Per item: seal to a base64 token, then open it back.
-	token, _ := scheme.SealString(masterKey, "top secret")
-	plain, _ := scheme.OpenString(masterKey, token)
-
-	fmt.Println(plain) // top secret
-
-	// Optional context binding: authenticate the record/field the token
-	// belongs to, so valid tokens cannot be swapped between rows.
-	bound, _ := scheme.SealStringAAD(masterKey, "top secret", []byte("user:42:note"))
-	_, err := scheme.OpenStringAAD(masterKey, bound, []byte("user:7:note"))
-	fmt.Println(err != nil) // wrong context fails to decrypt
-}
-```
-
-Under the hood every item gets a fresh per-item sub-key (HKDF) and its own
-random nonce, so a nonce can never repeat under the same key.
-The envelope header is authenticated, and every `Seal*`/`Open*` function
-has an `AAD` variant that additionally authenticates caller-supplied context.
-
-### Large files (streaming)
-
-`Seal*`/`Open*` hold the whole item in memory. For data that does not fit,
-such as a 10 GB backup, a 100 GB disk image or an upload of unknown length,
-the same scheme also streams, sealing one chunk at a time:
-
-```go
-// Whole files, in constant memory. The destination must not exist yet.
-n, err := scheme.SealFileAAD(masterKey, "backup.tar.enc", "backup.tar", []byte("backup.tar"))
-_, err = scheme.OpenFileAAD(masterKey, "restored.tar", "backup.tar.enc", []byte("backup.tar"))
-
-// Or plug into any io.Reader / io.Writer: HTTP bodies, S3 objects, pipes.
-_, err = scheme.SealStream(masterKey, w, r) // io.Writer <- io.Reader
-_, err = scheme.OpenStream(masterKey, w, r)
-
-// Or take the writer/reader themselves and compose freely.
-sw, err := scheme.SealWriter(masterKey, dst) // io.WriteCloser
-defer sw.Abort()                             // no-op once Close has succeeded
-if _, err := io.Copy(sw, src); err != nil {
-	return err // not every source failure reaches sw, so Close alone is not enough
-}
-err = sw.Close() // seals the final chunk; the stream is only complete after this
-
-sr, err := scheme.OpenReader(masterKey, src) // io.Reader
-defer sr.Abort()                             // wipes the held chunk if you stop early
-_, err = io.Copy(dst, sr)
-```
-
-Each chunk (1 MiB by default, `Config.ChunkSize`) is sealed under the same
-per-stream sub-key with the nonce `noncePrefix || counter || finalFlag`, so
-chunks cannot be reordered, duplicated, dropped, or the stream cut short: a
-truncated file fails to open instead of decrypting to truncated plaintext.
-Every stream records its own chunk size, so changing `ChunkSize` later never
-orphans sealed data.
-
-**What it costs.** A stream holds exactly one chunk in memory whatever the
-input size, and that buffer is allocated once per stream and reused, so
-nothing is allocated per chunk: sealing a 100 GB file costs the same handful
-of allocations as sealing 1 KB. On the wire:
-
-```text
-sealed = 37 + plaintext + 16 * chunks     chunks = ceil(plaintext / ChunkSize), min 1
-```
-
-That is a 37-byte header plus one 16-byte tag per chunk, so a 10 GiB file at
-the default 1 MiB chunk size grows by 160 KiB, about 0.0015%. Larger chunks
-mean less overhead and more memory per stream; smaller chunks the reverse.
-`MinChunkSize` (1 KiB) keeps the worst case under 2%, and `MaxChunkSize`
-(64 MiB) is the widest the format allows. A reader allocates whatever the header
-names before anything authenticates, so a service that only writes small chunks
-should say so with `Config.MaxAcceptedChunkSize` rather than accept 64 MiB per
-concurrent open from a stranger.
-
-### Hiding the file length
-
-A sealed stream states its chunk size in the clear, so the exact plaintext
-length follows from the file size. The padded pair pads the payload first,
-inside the encryption:
-
-```go
-// Files: the payload size comes from a Stat.
-n, err := scheme.SealPaddedFileAAD(masterKey, "doc.enc", "doc.pdf", []byte("doc"))
-_, err = scheme.OpenPaddedFileAAD(masterKey, "doc.out", "doc.enc", []byte("doc"))
-
-// Anything else: an io.Reader plus its length. Nothing is staged on disk.
-_, err = scheme.SealPaddedStream(masterKey, w, r, size) // io.Writer <- io.Reader
-_, err = scheme.OpenPaddedStream(masterKey, w, r)
-
-// No length, but an empty io.WriterAt destination such as a new *os.File.
-_, err = scheme.SealPaddedAt(masterKey, f, r) // io.WriterAt <- io.Reader
-
-// Pull the payload instead: Size comes from the authenticated frame before
-// any body is read, which is what a handler needs to set Content-Length.
-pr, err := scheme.OpenPaddedReader(masterKey, r) // io.ReadCloser
-length := pr.Size()                              // before a byte of body
-_, err = io.Copy(w, pr)
-err = pr.Close() // nil only if the payload was complete with authentic padding
-```
-
-All three sealers produce the same format, so a padded blob sealed one way
-opens every other way. Padding costs no memory: the frame, the payload and the
-zero padding are pulled through the chunk sealer as it asks for them, so a
-padded 10 GB upload is sealed on the fly exactly like an unpadded one.
-`SealPaddedStream` needs the length in advance, since it is written ahead of the
-payload and fixes the bucket: pass a `Content-Length`, a `len()`, or use the
-file form. A source that then delivers a different number of bytes fails with
-`ErrSourceShort` or `ErrSourceLong` (both match `ErrSourceSize`) at the payload
-boundary, before a single byte of padding is written, which is what makes
-`size` safe to accept from an untrusted peer. `SealPaddedAt` needs no length:
-it holds the chunk carrying the frame, seals it last and writes it back at its
-offset, at the cost of a second chunk of memory.
-
-The payload is framed as `version(1) || realLen(8) || payload || zero padding`
-and rounded up to a Padmé bucket (`PaddedSize`), destroying 12 to 25 bits of
-the length (for sizes from 128 KiB to 2 GiB) for 1 to 3% extra storage on
-average. In the [Padmé paper](https://arxiv.org/abs/1806.03160), 83% of Ubuntu
-packages and 87% of YouTube videos are uniquely identified by their exact size;
-after padding, 3%. Every opener reads the padding back, authenticates it and checks it is
-all zeros before discarding it, so truncation inside the padding still fails.
-
-**When the length is not knowable up front**, as with an HTML multipart upload
-(no per-part `Content-Length`, and the file is chosen after the page loads),
-write it into a file with `SealPaddedAt`, or, when the destination is not an
-`io.WriterAt`, seal it unpadded and pad it afterwards:
-
-```go
-// Request path: SealStream takes no size at all.
-n, err := scheme.SealStreamAAD(masterKey, dst, part, aad)
-
-// Background pass: open the unpadded object and re-seal it padded.
-// n comes from stage 1 here, or from the sealed size (see below).
-r, err := scheme.OpenReaderAAD(masterKey, src, aad)
-_, err = scheme.SealPaddedStreamAAD(masterKey, dst2, r, n, aad)
-```
-
-Nothing has to carry `n` between the two stages: an unpadded stream is
-`StreamHeaderSize + n + 16*max(1, ceil(n/ChunkSize))` bytes, and `PlaintextLen` inverts
-that, so the sealed size gives the length back. A crash then leaves a valid
-sealed object rather than a lost upload. Which objects still owe a pass is the one thing this does not tell you for
-free: padded and plain blobs are deliberately indistinguishable, so an unpadded
-object opened as padded fails with `ErrStreamAuth`, exactly like a wrong key.
-Retry with `OpenStream` to identify it, or track the state alongside the object.
-The two formats are told apart by a format tag that every chunk authenticates
-and no file stores, bound to the caller's AAD as one fixed-width digest, so
-neither reader can be talked into accepting the other's stream whatever AAD it
-is handed.
-
-Only the length is hidden. File names, timestamps and access patterns leak
-independently; use `RandomHex` names if that matters.
-
-## Choosing an algorithm
-
-| If you want to… | Reach for | Key |
-| --- | --- | --- |
-| Encrypt data with a key you already hold or derive | **AES-256-GCM** or **XChaCha20-Poly1305** | 32 bytes |
-| Encrypt many messages under one key without nonce worries | **XChaCha20-Poly1305** | 32 bytes |
-| Let someone encrypt *to you* using your public key | **RSA-OAEP** | PEM key pair |
-| Protect many records under one rotatable secret | **`envelope`** subpackage | derived |
-| Encrypt a file too big to hold in memory | **`envelope`** streaming (`SealFile`, `SealWriter`) | derived |
-| Stop a file's size from identifying it | **`envelope`** padding (`SealPaddedFile`, `SealPaddedStream`, `SealPaddedAt`) | derived |
-
-## API at a glance
-
-| Area | Key functions |
-| --- | --- |
-| AES-GCM (`aes.go`) | `EncryptAesGcm` / `DecryptAesGcm` (+ `Byte` and `WithNonceAppended` variants) |
-| ChaCha20-Poly1305 (`chaCha20.go`) | `EncryptChacha20poly1305` / `DecryptChacha20poly1305` (96-bit nonce) |
-| XChaCha20-Poly1305 (`chaCha20.go`) | `EncryptXChacha20poly1305` / `DecryptXChacha20poly1305` (192-bit nonce) |
-| RSA-OAEP (`rsa.go`) | `Encoder.EncryptRSA` / `Decoder.DecryptRSA` (+ `Byte` variants) |
-| Base64 (`base64.go`) | `Encoder.ToBase64*` / `Decoder.FromBase64*` (Std, RawStd, URL, RawURL) |
-| Envelope (`envelope/`) | `New`/`Default`, `Scheme.Seal*`/`Open*` (+ `AAD` variants), `DeriveKEK`, `GenerateMasterKey`, `WrapKey`/`UnwrapKey`, `Zero`, `Sha256Hex`, `RandomHex` |
-| Envelope streaming (`envelope/`) | `Scheme.SealFile`/`OpenFile`, `SealStream`/`OpenStream`, `SealWriter`/`OpenReader`/`StreamWriter.Abort`/`StreamReader.Abort` (+ `AAD` variants), `StreamHeaderSize`, `PlaintextLen` |
-| Envelope padding (`envelope/`) | `Scheme.SealPaddedFile`/`OpenPaddedFile`, `SealPaddedStream`/`OpenPaddedStream`, `SealPaddedAt`, `OpenPaddedReader` (+ `AAD` variants), `PaddedReader.Size`/`Close`, `PaddedSize` |
-
-The ChaCha20/XChaCha20 `Byte...WithNonceAppended` functions also come in
-`...AAD` forms that bind caller-supplied associated data (authenticated, not
-encrypted) into the ciphertext.
-
-Full, always-current reference lives on
-[pkg.go.dev](https://pkg.go.dev/github.com/pilinux/crypt).
-
-## Runnable examples
-
-Each folder under [`_example`](_example) is a standalone program you can run
-with `go run ./_example/<name>`:
-
-- [AES](_example/aes/main.go)
-- [ChaCha20-Poly1305 AEAD](_example/chacha20poly1305/main.go)
-- [XChaCha20-Poly1305 AEAD](_example/xchacha20poly1305/main.go)
-- [RSA](_example/rsa/main.go)
-- [Hashing](_example/hashing/main.go)
-- [TLS 1.3 mutual authentication](_example/tls/main.go): a PING/PONG exchange
-  over TLS using only the standard library, with a
-  [walkthrough of the handshake](_example/tls/README.md).
-- [Benchmark](_example/benchmark/main.go): an ad-hoc timing loop over the
-  ciphers, not `go test` benchmarks.
-- [Envelope encryption at rest](_example/envelope/main.go). Add `-serve
-  127.0.0.1:8080` to skip the demos and start a small upload server
-  ([server.go](_example/envelope/server.go)) instead, which pushes a real file
-  of your choosing through the streaming and padding APIs: an upload is padded
-  on the request path with `SealPaddedAtAAD`, and a download sets
-  `Content-Length` from `PaddedReader.Size`. It caps uploads at 1 GiB and keeps
-  ciphertext in a temp dir; `-max 0 -dir /path` lifts both, which is what a
-  multi-gigabyte test needs; `-chunk` sets the chunk size (default 1 MiB) and
-  `-debug` logs how each padded upload is sealed, payload length and first
-  bytes included. Verified at 5 GB, with the server sitting at 8.9 MiB
-  resident.
-
-## Generate RSA keys
-
-RSA works with a PKIX public key (`PUBLIC KEY`) and a PKCS#8 private key
-(`PRIVATE KEY`): exactly what these OpenSSL commands produce.
-
-### RSA-2048 (256-byte)
+The public key has to be a PKIX `PUBLIC KEY` block and the private key a PKCS#8
+`PRIVATE KEY` block. OpenSSL produces both public and private keys in the right
+format:
 
 ```bash
-openssl genpkey -algorithm RSA -out private-key.pem -pkeyopt rsa_keygen_bits:2048
-openssl rsa -in private-key.pem -pubout -out public-key.pem
+openssl genpkey -algorithm RSA -out private-2048.pem -pkeyopt rsa_keygen_bits:2048
+openssl pkey -in private-2048.pem -pubout -out public-2048.pem
+
+openssl genpkey -algorithm RSA -out private-3072.pem -pkeyopt rsa_keygen_bits:3072
+openssl pkey -in private-3072.pem -pubout -out public-3072.pem
+
+openssl genpkey -algorithm RSA -out private-4096.pem -pkeyopt rsa_keygen_bits:4096
+openssl pkey -in private-4096.pem -pubout -out public-4096.pem
 ```
 
-### RSA-3072 (384-byte)
+`Encoder` and `Decoder` also carry Base64 helpers (`ToBase64Std`,
+`ToBase64RawStd`, `ToBase64URL`, `ToBase64RawURL` and the `FromBase64*`
+counterparts). They don't use the key, so a zero `Encoder{}` or `Decoder{}`
+works.
 
-```bash
-openssl genpkey -algorithm RSA -out private-key.pem -pkeyopt rsa_keygen_bits:3072
-openssl rsa -in private-key.pem -pubout -out public-key.pem
+## Envelope encryption
+
+The [`envelope`](envelope/README.md) package is for apps that store a lot of
+encrypted data. A secret from your environment wraps a random master key, and
+every item is sealed under its own key derived from that master key. Rotating
+the secret means re-wrapping one 32-byte key, not re-encrypting the database.
+
+```go
+scheme := envelope.New(envelope.Config{
+	KEKLabel:    "myapp:kek:v1", // don't change these once data exists
+	SubKeyLabel: "myapp:data-subkey:v1",
+})
+
+// Once: create a master key and store it wrapped.
+kek, err := scheme.DeriveKEK(os.Getenv("ENCRYPTION_SECRET"))
+masterKey, err := envelope.GenerateMasterKey()
+wrapped, err := envelope.WrapKey(kek, masterKey) // save this, not masterKey
+envelope.Zero(kek)
+
+// Per item. The AAD ties a token to its row, so tokens can't be swapped.
+aad := []byte("user:42:email")
+token, err := scheme.SealStringAAD(masterKey, "alice@example.com", aad)
+email, err := scheme.OpenStringAAD(masterKey, token, aad)
 ```
 
-### RSA-4096 (512-byte)
+`ENCRYPTION_SECRET` must be at least 32 random bytes (`openssl rand -hex 32`),
+not a password. The KEK comes from HKDF, which does no stretching, so a weak
+secret can be brute-forced from the wrapped key.
 
-```bash
-openssl genpkey -algorithm RSA -out private-key.pem -pkeyopt rsa_keygen_bits:4096
-openssl rsa -in private-key.pem -pubout -out public-key.pem
+It also handles large data:
+
+- **Streaming.** `SealFile`, `SealStream` and `SealWriter` encrypt in chunks
+  (1 MiB by default) with constant memory, whatever the size. If chunks are
+  reordered, repeated, dropped or cut off, the stream fails to open.
+- **Length hiding.** `SealPaddedFile`, `SealPaddedStream` and `SealPaddedAt`
+  pad the data before sealing, so the ciphertext size no longer gives away the
+  exact file size.
+
+```go
+n, err := scheme.SealFile(masterKey, "backup.tar.enc", "backup.tar")
+n, err = scheme.OpenFile(masterKey, "restored.tar", "backup.tar.enc")
 ```
+
+The [envelope README](envelope/README.md) covers the rest: which function to
+pick, the wire format, the errors, and what a ciphertext still reveals.
 
 ## Security notes
 
-- **Bring your own key derivation.** `crypt` encrypts with the key you give it;
-  it never derives one. Use Argon2id for passwords and HKDF for high-entropy
-  secrets (the `envelope` subpackage does the latter for you).
-- **The envelope secret must be machine-generated.** `DeriveKEK` uses HKDF,
-  which does no password stretching: generate `ENCRYPTION_SECRET` with
-  `openssl rand -hex 32` (or similar) and never use a human-chosen passphrase.
-  The floor is 32 **bytes**, which is what `len(secret)` measures.
-  A guessable secret can be brute-forced offline from the wrapped master key.
-- **Key sizes.** AES accepts 16/24/32-byte keys; ChaCha20 and XChaCha20 require
-  exactly 32 bytes.
-- **Never reuse a (key, nonce) pair.** Nonces come from `crypto/rand`. When
-  encrypting many items under one key, prefer XChaCha20-Poly1305 or the
-  `envelope` scheme, which give each item its own key or a large random nonce.
-- **Everything is authenticated.** All AEAD modes and RSA-OAEP fail closed:
-  tampered ciphertext or a wrong key returns an error, never partial plaintext
-  (streams are the exception; see below). In the `envelope` package an
-  authentication failure is a sentinel: `ErrEnvelopeAuth` for a token or a
-  wrapped key, `ErrStreamAuth` for a stream. Neither says which of
-  "wrong key", "wrong AAD" or "altered bytes" it was, since telling those apart
-  is what an attacker probing a datastore would want. Input too damaged to
-  parse fails earlier, with an error such as `ErrBadEnvelope` or `ErrBadStream`.
-- **Fail closed on bad input, never panic.** The `Decrypt…` functions that take
-  a nonce directly validate its length (12 bytes for AES-GCM and
-  ChaCha20-Poly1305, 24 for XChaCha20-Poly1305) and return an error on a
-  mismatch instead of letting the underlying cipher panic.
-- **Per-message size limit.** A single message is capped by the underlying
-  AEAD: roughly **256 GiB** for ChaCha20/XChaCha20-Poly1305 and **64 GiB** for
-  AES-GCM. Anything larger returns an error rather than panicking. These bounds
-  sit far above any realistic payload; for data that big use the `envelope`
-  streaming API, which chunks it and lifts the ceiling.
-- **A stream is only trustworthy once it ends.** The streaming API authenticates
-  every chunk before releasing it, but a consumer that acts on partial output
-  has acted on data whose stream may still fail. Treat the destination as
-  unusable until the call returns without error. `StreamWriter.Close`
-  finalizes a stream that has not failed and refuses one that has, so a source
-  that quit part-way cannot be closed into a valid short stream. That needs the
-  writer to see the failure: check `io.Copy`'s error too, because a source with
-  its own `WriteTo` method (a `StreamReader`, say) reports failures only to
-  `io.Copy`. Only `io.EOF`
-  counts as the end of a source: an `io.ErrUnexpectedEOF` from a cut-off HTTP
-  body fails the seal. Use `StreamWriter.Abort` for the case nothing failed and
-  you simply do not want the stream: `defer sw.Abort()` costs nothing once
-  `Close` has succeeded. `StreamReader.Abort` is the reading half: stop before
-  the end and it wipes the decrypted chunk the reader still holds. A
-  `PaddedReader` read for exactly `Size()` bytes has not checked its padding
-  yet; `Close` is where that happens.
-- **Ciphertext reveals its plaintext length.** Both formats store enough in the
-  clear to recover it exactly: `blob - 58` for a token, `size - 37 - 16*chunks`
-  for a stream. Content, key and context stay hidden, but size alone can
-  identify a known file. Use `SealPaddedFile` for files and
-  `SealPaddedStream` for everything else; when the length is not known up
-  front, use `SealPaddedAt` into a file, or seal unpadded and pad in a second
-  pass. `SealInt64` is already fixed-width, and other tokens need padding
-  before you seal them.
-- **RSA key formats.** The public key must be a PKIX `PUBLIC KEY` block and the
-  private key a PKCS#8 `PRIVATE KEY` block. Always check `.Err` right after
-  `NewEncoder` / `NewDecoder`.
+- AES takes a 16, 24 or 32-byte key. ChaCha20 and XChaCha20 take 32 bytes.
+- AES-GCM and ChaCha20-Poly1305 use random 96-bit nonces, so keep the number of
+  messages per key well below 2^32. XChaCha20 and `envelope` don't have this
+  problem.
+- A wrong key, changed ciphertext or malformed input (a nonce of the wrong
+  length, say) returns an error instead of panicking or returning garbage.
+- A single message is limited to about 256 GiB with ChaCha20 and 64 GiB with
+  AES-GCM. Use `envelope` streaming for anything bigger.
+- Don't use the output of a stream until the call that produced it returns
+  without error. A `StreamWriter` is complete only after `Close` succeeds.
+- Ciphertext size reveals plaintext size. If that matters, use the padded
+  functions in `envelope`.
+
+## Examples
+
+Each folder under [`_example`](_example) is a small program. Run one with
+`go run ./_example/<name>`.
+
+- [aes](_example/aes/main.go), [chacha20poly1305](_example/chacha20poly1305/main.go),
+  [xchacha20poly1305](_example/xchacha20poly1305/main.go), [rsa](_example/rsa/main.go),
+  [hashing](_example/hashing/main.go)
+- [envelope](_example/envelope/main.go): the envelope package end to end. With
+  `-serve 127.0.0.1:8080` it runs a small upload server instead, for trying
+  streaming and padding on real files (`-h` lists the options).
 
 ## Development
 
