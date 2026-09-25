@@ -65,11 +65,11 @@ func main() {
 
 	// ============================================================================
 	// encrypt a file (dummy.pdf) using XChaCha20-Poly1305
-	// the encrypted file will be saved as dummy.pdf.enc
+	// the encrypted file will be saved as dummy.pdf.enc (salt || nonce || ciphertext)
 	// ============================================================================
 	filename := "dummy.pdf"
 	encryptedFilename := filename + ".enc"
-	decryptedFilename := filename
+	decryptedFilename := "decrypted-" + filename
 
 	// read the file
 	pdfBytes, err := os.ReadFile(filename)
@@ -85,25 +85,19 @@ func main() {
 		return
 	}
 
-	// save the encrypted data to a file
-	err = os.WriteFile(encryptedFilename, ciphertext, 0644)
+	// save the encrypted data to a file, salt first: the salt isn't secret, and
+	// without it the key can never be derived again
+	err = os.WriteFile(encryptedFilename, append(salt, ciphertext...), 0600)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	fmt.Println("encrypted file:", encryptedFilename)
 
-	// delete the original file
-	err = os.Remove(filename)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	fmt.Println("original file deleted:", filename)
-
 	// ============================================================================
 	// decrypt the encrypted file (dummy.pdf.enc) using XChaCha20-Poly1305
-	// the decrypted file will be saved as dummy.pdf
+	// the decrypted file will be saved as decrypted-dummy.pdf; the original is
+	// never touched
 	// ============================================================================
 	// read the encrypted file
 	encryptedPdfBytes, err := os.ReadFile(encryptedFilename)
@@ -111,16 +105,24 @@ func main() {
 		fmt.Println(err)
 		return
 	}
+	if len(encryptedPdfBytes) < len(salt) {
+		fmt.Println("encrypted file is too short")
+		return
+	}
+
+	// derive the key again from the stored salt, as a later run would have to
+	storedSalt, sealed := encryptedPdfBytes[:len(salt)], encryptedPdfBytes[len(salt):]
+	key = argon2.IDKey([]byte(secretPass), storedSalt, uint32(timeCost), uint32(memoryCost), uint8(cpuCost), uint32(keyLength))
 
 	// decrypt the data
-	decryptedPdfBytes, err := crypt.DecryptByteXChacha20poly1305WithNonceAppended(key, encryptedPdfBytes)
+	decryptedPdfBytes, err := crypt.DecryptByteXChacha20poly1305WithNonceAppended(key, sealed)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
 	// save the decrypted data to a file
-	err = os.WriteFile(decryptedFilename, decryptedPdfBytes, 0644)
+	err = os.WriteFile(decryptedFilename, decryptedPdfBytes, 0600)
 	if err != nil {
 		fmt.Println(err)
 		return
